@@ -1,0 +1,26 @@
+<customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui" onLoad="ribbon.OnAddinLoad">
+  <ribbon startFromScratch="false">
+    <tabs>
+      <tab id="wpsAiTab" label="WPS AI">
+        <group id="wpsAiGroup" label="文档生成">
+          <button
+            id="btnToggleTaskPane"
+            label="打开 AI 助手"
+            size="large"
+            onAction="ribbon.OnAction"
+            getImage="ribbon.GetImage"
+            getEnabled="ribbon.OnGetEnabled"
+          />
+          <button
+            id="btnFocusTaskPane"
+            label="显示任务窗格"
+            size="large"
+            onAction="ribbon.OnAction"
+            getImage="ribbon.GetImage"
+            getEnabled="ribbon.OnGetEnabled"
+          />
+        </group>
+      </tab>
+    </tabs>
+  </ribbon>
+</customUI>
