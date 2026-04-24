@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<JsPlugin>
+  <ApiVersion>1.0.0</ApiVersion>
+  <Name>WPSAIWriter</Name>
+  <Description>在 WPS 中调用 OpenRouter 或 NVIDIA Build，并将 AI 输出实时写入正文</Description>
+</JsPlugin>

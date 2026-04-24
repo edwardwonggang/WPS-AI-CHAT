@@ -1,0 +1,18 @@
+<customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui" onLoad="ribbon.OnAddinLoad">
+  <ribbon startFromScratch="false">
+    <tabs>
+      <tab id="wpsAiTab" label="WPS AI">
+        <group id="wpsAiGroup" label="智能写作">
+          <button
+            id="btnOpenAssistant"
+            label="打开 AI 助手"
+            size="large"
+            onAction="ribbon.OnAction"
+            getImage="ribbon.GetImage"
+            getEnabled="ribbon.OnGetEnabled"
+          />
+        </group>
+      </tab>
+    </tabs>
+  </ribbon>
+</customUI>
