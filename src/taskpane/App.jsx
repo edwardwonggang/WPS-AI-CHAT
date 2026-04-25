@@ -1,4 +1,15 @@
-import { Eraser, Gauge, SendHorizontal, ServerCog, SlidersHorizontal, Square, X } from "lucide-react";
+import {
+  Clipboard,
+  Eraser,
+  Gauge,
+  ScrollText,
+  SendHorizontal,
+  ServerCog,
+  SlidersHorizontal,
+  Square,
+  Trash2,
+  X
+} from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import {
   DEFAULT_SETTINGS,
@@ -38,6 +49,13 @@ import {
   loadDocumentSession,
   saveDocumentSession
 } from "./sessionStore";
+import {
+  clearDebugLogs,
+  formatDebugLogs,
+  pushDebugLog,
+  readDebugLogs,
+  subscribeDebugLogs
+} from "./debugLog";
 
 function createMessageId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -71,6 +89,53 @@ function modelEntryTitle(entry) {
   return lines.join("\n");
 }
 
+const E2E_RICH_FORMAT_SAMPLE = [
+  "# E2E Title",
+  "",
+  "This is the first body paragraph used to verify standard paper formatting, first-line indentation, left alignment, and comfortable line spacing.",
+  "",
+  "This is the second body paragraph used to confirm content is appended at the document end and that real-time paragraph formatting remains stable.",
+  "",
+  "## List Check",
+  "",
+  "- List item one",
+  "- List item two",
+  "",
+  "## Code Block Check",
+  "",
+  "```js",
+  "function sum(a, b) {",
+  "  return a + b;",
+  "}",
+  "```",
+  "",
+  "## Formula Check",
+  "",
+  "$$",
+  "E = mc^2",
+  "$$",
+  "",
+  "## Table Check",
+  "",
+  "| Person | Role |",
+  "| --- | --- |",
+  "| Gattuso | Patriarch<br>Current: effective leader of the New Secret Party |",
+  "| Vito | Elder |"
+].join("\n");
+
+function shouldRunWpsE2E() {
+  if (!hasWpsDocument()) {
+    return false;
+  }
+
+  try {
+    const url = new URL(window.location.href);
+    return url.searchParams.get("e2e") === "rich-format";
+  } catch {
+    return false;
+  }
+}
+
 const ICONS = {
   settings: SlidersHorizontal,
   clear: Eraser,
@@ -78,7 +143,10 @@ const ICONS = {
   stop: Square,
   close: X,
   provider: ServerCog,
-  flask: Gauge
+  flask: Gauge,
+  logs: ScrollText,
+  copy: Clipboard,
+  trash: Trash2
 };
 
 function Icon({ name }) {
@@ -98,6 +166,7 @@ export default function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showModelLab, setShowModelLab] = useState(false);
+  const [showLogs, setShowLogs] = useState(false);
   const [modelCatalog, setModelCatalog] = useState(() =>
     normalizeModelCatalogState(loadStoredValue(MODEL_CATALOG_KEY, []))
   );
@@ -109,6 +178,8 @@ export default function App() {
     completed: 0,
     total: 0
   });
+  const [debugLogs, setDebugLogs] = useState(() => readDebugLogs());
+  const [copyLogStatus, setCopyLogStatus] = useState("");
 
   const abortRef = useRef(null);
   const benchmarkAbortRef = useRef(null);
@@ -143,6 +214,10 @@ export default function App() {
   }, [modelCatalog]);
 
   useEffect(() => {
+    return subscribeDebugLogs(setDebugLogs);
+  }, []);
+
+  useEffect(() => {
     latestMessagesRef.current = messages;
   }, [messages]);
 
@@ -154,6 +229,30 @@ export default function App() {
     if (hasWpsDocument()) {
       setSelectionText(readSelectionText());
     }
+  }, []);
+
+  useEffect(() => {
+    if (!shouldRunWpsE2E()) {
+      return;
+    }
+
+    const e2eKey = "wps_ai_e2e_rich_format_done";
+    if (window.sessionStorage.getItem(e2eKey) === "1") {
+      return;
+    }
+
+    const timerId = window.setTimeout(() => {
+      try {
+        const sink = createWpsMarkdownSink({ replaceSelection: false });
+        sink.write(E2E_RICH_FORMAT_SAMPLE);
+        sink.finish();
+        window.sessionStorage.setItem(e2eKey, "1");
+      } catch (e) {
+        console.error("WPS E2E table test failed:", e);
+      }
+    }, 1200);
+
+    return () => window.clearTimeout(timerId);
   }, []);
 
   useEffect(() => {
@@ -217,7 +316,7 @@ export default function App() {
   }, [messages]);
 
   useEffect(() => {
-    if (!showSettings && !showModelLab) {
+    if (!showSettings && !showModelLab && !showLogs) {
       return undefined;
     }
 
@@ -225,12 +324,13 @@ export default function App() {
       if (event.key === "Escape") {
         setShowSettings(false);
         setShowModelLab(false);
+        setShowLogs(false);
       }
     }
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [showModelLab, showSettings]);
+  }, [showLogs, showModelLab, showSettings]);
 
   useEffect(() => {
     if (
@@ -401,12 +501,20 @@ export default function App() {
 
   function openSettings() {
     setShowModelLab(false);
+    setShowLogs(false);
     setShowSettings(true);
   }
 
   function openModelLab() {
     setShowSettings(false);
+    setShowLogs(false);
     setShowModelLab(true);
+  }
+
+  function openLogs() {
+    setShowSettings(false);
+    setShowModelLab(false);
+    setShowLogs(true);
   }
 
   function switchProvider(providerId) {
@@ -475,6 +583,7 @@ export default function App() {
 
   function queueAssistantChunk(messageId, chunk) {
     const buffer = messageBufferRef.current;
+    const shouldFlushImmediately = !buffer.chunk || chunk.includes("\n");
 
     if (buffer.messageId && buffer.messageId !== messageId) {
       flushBufferedAssistantMessage(buffer.messageId);
@@ -484,6 +593,11 @@ export default function App() {
     buffer.messageId = messageId;
     buffer.chunk += chunk;
 
+    if (shouldFlushImmediately) {
+      flushBufferedAssistantMessage(messageId);
+      return;
+    }
+
     if (buffer.timerId !== null) {
       return;
     }
@@ -491,12 +605,12 @@ export default function App() {
     buffer.timerId = window.setTimeout(() => {
       messageBufferRef.current.timerId = null;
       flushBufferedAssistantMessage(messageId);
-    }, 16);
+    }, 8);
   }
 
   async function handleLoadModels() {
     if (!settings.apiKey.trim()) {
-      setModelLabError("请先填写 API 密钥，再加载 NVIDIA 模型。");
+      setModelLabError("Enter the API key before loading NVIDIA models.");
       return;
     }
 
@@ -506,6 +620,7 @@ export default function App() {
     try {
       const items = await loadNvidiaModels({
         apiKey: settings.apiKey,
+        settings,
         signal: undefined
       });
 
@@ -515,7 +630,7 @@ export default function App() {
       });
     } catch (caught) {
       setModelLabError(
-        caught instanceof Error ? caught.message : "加载模型失败。"
+        caught instanceof Error ? caught.message : "Failed to load models."
       );
     } finally {
       setIsLoadingModels(false);
@@ -524,7 +639,7 @@ export default function App() {
 
   async function handleBenchmarkModels() {
     if (!settings.apiKey.trim()) {
-      setModelLabError("请先填写 API 密钥，再执行模型测速。");
+      setModelLabError("Enter the API key before running model benchmarks.");
       return;
     }
 
@@ -534,13 +649,14 @@ export default function App() {
       try {
         const fetched = await loadNvidiaModels({
           apiKey: settings.apiKey,
+          settings,
           signal: undefined
         });
         items = fetched.map((item) => createModelEntry(item));
         setModelCatalog(items);
       } catch (caught) {
         setModelLabError(
-          caught instanceof Error ? caught.message : "加载模型失败。"
+          caught instanceof Error ? caught.message : "Failed to load models."
         );
         setIsLoadingModels(false);
         return;
@@ -561,6 +677,7 @@ export default function App() {
       for await (const event of streamNvidiaModelBenchmarks({
         apiKey: settings.apiKey,
         models: items.map((entry) => entry.id),
+        settings,
         timeoutMs: 20000,
         concurrency: 6,
         signal: controller.signal
@@ -592,7 +709,7 @@ export default function App() {
     } catch (caught) {
       if (!(caught instanceof DOMException && caught.name === "AbortError")) {
         setModelLabError(
-          caught instanceof Error ? caught.message : "模型测速失败。"
+          caught instanceof Error ? caught.message : "Model benchmark failed."
         );
       }
     } finally {
@@ -610,13 +727,13 @@ export default function App() {
   async function handleGenerate() {
     const trimmedPrompt = prompt.trim();
     if (!settings.apiKey.trim()) {
-      setError("请先填写 API 密钥。");
+      setError("Enter the API key first.");
       openSettings();
       return;
     }
 
     if (!settings.model.trim()) {
-      setError("请先填写模型名称。");
+      setError("Enter the model name first.");
       openSettings();
       return;
     }
@@ -627,6 +744,9 @@ export default function App() {
 
     setError("");
     setIsGenerating(true);
+    pushDebugLog("info", "ui", "User submitted a generation request.", {
+      promptLength: trimmedPrompt.length
+    });
 
     let latestSelectionText = selectionText;
     if (settings.useSelectionAsContext) {
@@ -662,14 +782,20 @@ export default function App() {
         messages: buildMessages({
           prompt: trimmedPrompt,
           selectionText: latestSelectionText,
-          settings
+          settings,
+          history: latestMessagesRef.current
         }),
         signal: controller.signal
       })) {
         aggregate += chunk;
         queueAssistantChunk(assistantMessageId, chunk);
+        sink.write(chunk);
       }
 
+      sink.finish();
+      pushDebugLog("info", "wps", "WPS sink finished appending streamed content.", {
+        chars: aggregate.length
+      });
       flushBufferedAssistantMessage(assistantMessageId);
       setMessages((current) =>
         current.map((message) =>
@@ -687,6 +813,7 @@ export default function App() {
 
       if (aborted) {
         sink.cancel();
+        pushDebugLog("warn", "ui", "Generation aborted by the user.");
         setMessages((current) =>
           current.map((message) =>
             message.id === assistantMessageId
@@ -695,14 +822,17 @@ export default function App() {
           )
         );
       } else {
-        const message = caught instanceof Error ? caught.message : "生成失败。";
+        const message = caught instanceof Error ? caught.message : "Generation failed.";
         setError(message);
+        pushDebugLog("error", "ui", "Generation ended with an error.", {
+          error: message
+        });
         setMessages((current) =>
           current.map((entry) =>
             entry.id === assistantMessageId
               ? {
                   ...entry,
-                  content: entry.content || "请求失败。",
+                  content: entry.content || "Request failed.",
                   streaming: false,
                   error: true
                 }
@@ -749,6 +879,40 @@ export default function App() {
     liveSinkRef.current = null;
   }
 
+  function clearLogs() {
+    clearDebugLogs();
+    setCopyLogStatus("");
+  }
+
+  async function copyLogs() {
+    const content = formatDebugLogs(debugLogs);
+    if (!content) {
+      setCopyLogStatus("No logs to copy.");
+      return;
+    }
+
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(content);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.value = content;
+        textarea.setAttribute("readonly", "true");
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        document.body.removeChild(textarea);
+      }
+
+      setCopyLogStatus("Logs copied.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Copy failed.";
+      setCopyLogStatus(message);
+    }
+  }
+
   const visibleModelCatalog = [...modelCatalog]
     .sort((left, right) => compareModelEntries(left, right, settings.model))
     .filter((entry) => {
@@ -761,6 +925,12 @@ export default function App() {
       return haystack.includes(query);
     });
 
+  const latestDebugLog = debugLogs[debugLogs.length - 1] ?? null;
+  const generatingStatus =
+    isGenerating && latestDebugLog
+      ? `${latestDebugLog.scope}: ${latestDebugLog.message}`
+      : "";
+
   return (
     <>
       <main className="minimal-shell">
@@ -771,8 +941,8 @@ export default function App() {
                 className="icon-button"
                 type="button"
                 onClick={openModelLab}
-                aria-label="模型测速"
-                title="模型测速"
+                aria-label="Model Benchmarks"
+                title="Model Benchmarks"
               >
                 <Icon name="flask" />
               </button>
@@ -781,8 +951,8 @@ export default function App() {
               className="icon-button"
               type="button"
               onClick={openSettings}
-              aria-label="设置"
-              title="设置"
+              aria-label="Settings"
+              title="Settings"
             >
               <Icon name="settings" />
             </button>
@@ -791,10 +961,19 @@ export default function App() {
               type="button"
               onClick={clearConversation}
               disabled={isGenerating || messages.length === 0}
-              aria-label="清理会话"
-              title="清理会话"
+              aria-label="Clear Conversation"
+              title="Clear Conversation"
             >
               <Icon name="clear" />
+            </button>
+            <button
+              className="icon-button quiet"
+              type="button"
+              onClick={openLogs}
+              aria-label="Logs"
+              title="Logs"
+            >
+              <Icon name="logs" />
             </button>
           </div>
         </header>
@@ -815,11 +994,6 @@ export default function App() {
                     <StreamingMarkdown
                       content={message.content}
                       streaming={message.streaming}
-                      sink={
-                        liveSinkRef.current?.messageId === message.id
-                          ? liveSinkRef.current.sink
-                          : null
-                      }
                     />
                   ) : (
                     <div className="bubble-plain">
@@ -834,6 +1008,7 @@ export default function App() {
 
         <footer className="minimal-composer">
           {error ? <div className="tiny-error">{error}</div> : null}
+          {generatingStatus ? <div className="tiny-status">{generatingStatus}</div> : null}
 
           <div className="composer-card">
             <textarea
@@ -851,8 +1026,8 @@ export default function App() {
                   className="icon-button ghost"
                   type="button"
                   onClick={stopGeneration}
-                  aria-label="停止生成"
-                  title="停止生成"
+                  aria-label="Stop Generation"
+                  title="Stop Generation"
                 >
                   <Icon name="stop" />
                 </button>
@@ -862,8 +1037,8 @@ export default function App() {
                 type="button"
                 disabled={isGenerating || !prompt.trim()}
                 onClick={() => void handleGenerate()}
-                aria-label="发送"
-                title="发送"
+                aria-label="Send"
+                title="Send"
               >
                 <Icon name="send" />
               </button>
@@ -888,7 +1063,7 @@ export default function App() {
                 className="icon-button quiet"
                 type="button"
                 onClick={() => setShowSettings(false)}
-                aria-label="关闭设置"
+                aria-label="Close Settings"
               >
                 <Icon name="close" />
               </button>
@@ -914,35 +1089,38 @@ export default function App() {
                 type="password"
                 value={settings.apiKey}
                 onChange={(event) => updateSetting("apiKey", event.target.value)}
-                placeholder="API 密钥"
+                placeholder="API Key"
               />
               <input
                 value={settings.model}
                 onChange={(event) => updateSetting("model", event.target.value)}
-                placeholder={placeholderModel(settings.providerId) || "模型名称"}
+                placeholder={placeholderModel(settings.providerId) || "Model Name"}
               />
               <input
                 value={settings.baseUrl}
                 onChange={(event) => updateSetting("baseUrl", event.target.value)}
-                placeholder="接口地址"
+                placeholder="Base URL"
               />
             </div>
 
             {settings.providerId === "nvidia" ? (
               <div className="utility-row">
+                <div className="tiny-error">
+                  {"Current mode: local relay. Network access is forwarded through the local 3888 relay."}
+                </div>
                 <button
                   className="secondary-button"
                   type="button"
                   onClick={openModelLab}
                 >
                   <Icon name="flask" />
-                  <span>模型测速</span>
+                  <span>Model Benchmarks</span>
                 </button>
               </div>
             ) : null}
 
             <details className="details-panel">
-              <summary>高级设置</summary>
+              <summary>Advanced Settings</summary>
               <div className="field-grid advanced">
                 <input
                   type="number"
@@ -953,7 +1131,7 @@ export default function App() {
                   onChange={(event) =>
                     updateSetting("temperature", Number(event.target.value || 0))
                   }
-                  placeholder="温度"
+                  placeholder="Temperature"
                 />
                 <input
                   type="number"
@@ -961,7 +1139,7 @@ export default function App() {
                   step="1"
                   value={settings.maxTokens}
                   onChange={(event) => updateSetting("maxTokens", event.target.value)}
-                  placeholder="最大输出长度（自动）"
+                  placeholder="Max Output Length (Auto)"
                 />
                 <textarea
                   rows="4"
@@ -969,10 +1147,10 @@ export default function App() {
                   onChange={(event) =>
                     updateSetting("systemPrompt", event.target.value)
                   }
-                  placeholder="系统提示词"
+                  placeholder="System Prompt"
                 />
                 <label className="toggle-item">
-                  <span>使用当前选区作为上下文</span>
+                  <span>Use Current Selection as Context</span>
                   <input
                     type="checkbox"
                     checked={settings.useSelectionAsContext}
@@ -982,7 +1160,7 @@ export default function App() {
                   />
                 </label>
                 <label className="toggle-item">
-                  <span>直接替换当前选区</span>
+                  <span>Replace Current Selection Directly</span>
                   <input
                     type="checkbox"
                     checked={settings.replaceSelection}
@@ -996,17 +1174,79 @@ export default function App() {
                     <input
                       value={settings.referer}
                       onChange={(event) => updateSetting("referer", event.target.value)}
-                      placeholder="来源站点"
+                      placeholder="Referrer"
                     />
                     <input
                       value={settings.title}
                       onChange={(event) => updateSetting("title", event.target.value)}
-                      placeholder="应用名称"
+                      placeholder="Application Title"
                     />
                   </>
                 ) : null}
               </div>
             </details>
+          </section>
+        </div>
+      ) : null}
+      {showLogs ? (
+        <div className="modal-backdrop" onClick={() => setShowLogs(false)}>
+          <section
+            className="modal-card compact wide"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="modal-toolbar">
+              <div className="modal-icons">
+                <span className="icon-badge">
+                  <Icon name="logs" />
+                </span>
+              </div>
+              <button
+                className="icon-button quiet"
+                type="button"
+                onClick={() => setShowLogs(false)}
+                aria-label="Close Logs"
+              >
+                <Icon name="close" />
+              </button>
+            </header>
+
+            <div className="log-toolbar">
+              <button className="secondary-button" type="button" onClick={() => void copyLogs()}>
+                <Icon name="copy" />
+                <span>Copy Logs</span>
+              </button>
+              <button className="secondary-button" type="button" onClick={clearLogs}>
+                <Icon name="trash" />
+                <span>Clear Logs</span>
+              </button>
+            </div>
+
+            {copyLogStatus ? <div className="tiny-status">{copyLogStatus}</div> : null}
+
+            <div className="log-list">
+              {debugLogs.length === 0 ? (
+                <div className="log-empty">No logs yet.</div>
+              ) : (
+                [...debugLogs].reverse().map((entry) => (
+                  <article
+                    key={entry.id}
+                    className={`log-entry ${entry.level === "error" ? "error" : ""}`}
+                  >
+                    <div className="log-meta">
+                      <span>{entry.time}</span>
+                      <span>{String(entry.level || "info").toUpperCase()}</span>
+                      <span>{entry.scope}</span>
+                    </div>
+                    <div className="log-message">{entry.message}</div>
+                    {entry.details && Object.keys(entry.details).length > 0 ? (
+                      <pre className="log-details">
+                        {JSON.stringify(entry.details, null, 2)}
+                      </pre>
+                    ) : null}
+                  </article>
+                ))
+              )}
+            </div>
           </section>
         </div>
       ) : null}
@@ -1026,7 +1266,7 @@ export default function App() {
                 className="icon-button quiet"
                 type="button"
                 onClick={() => setShowModelLab(false)}
-                aria-label="关闭模型测速"
+                aria-label="Close Model Benchmarks"
               >
                 <Icon name="close" />
               </button>
@@ -1037,7 +1277,7 @@ export default function App() {
                 className="model-search-input"
                 value={modelSearch}
                 onChange={(event) => setModelSearch(event.target.value)}
-                placeholder="搜索模型"
+                placeholder="Search Models"
               />
 
               <div className="lab-actions">
@@ -1047,7 +1287,7 @@ export default function App() {
                   onClick={() => void handleLoadModels()}
                   disabled={isLoadingModels || isBenchmarkingModels}
                 >
-                  <span>{isLoadingModels ? "加载中..." : "刷新模型"}</span>
+                  <span>{isLoadingModels ? "Loading..." : "Refresh Models"}</span>
                 </button>
 
                 <button
@@ -1062,8 +1302,8 @@ export default function App() {
                 >
                   <span>
                     {isBenchmarkingModels
-                      ? `停止测速 ${benchmarkProgress.completed}/${benchmarkProgress.total}`
-                      : "开始测速"}
+                      ? `Stop Benchmark ${benchmarkProgress.completed}/${benchmarkProgress.total}`
+                      : "Start Benchmark"}
                   </span>
                 </button>
               </div>
@@ -1094,7 +1334,7 @@ export default function App() {
                       type="button"
                       onClick={() => applyModel(entry.id)}
                     >
-                      <span>{settings.model === entry.id ? "当前" : "使用"}</span>
+                      <span>{settings.model === entry.id ? "Current" : "Use"}</span>
                     </button>
                   </div>
                 </article>

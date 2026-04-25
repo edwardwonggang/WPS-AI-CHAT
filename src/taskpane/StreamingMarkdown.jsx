@@ -1,112 +1,67 @@
-import { useEffect, useRef } from "react";
-import {
-  default_add_text,
-  default_add_token,
-  default_end_token,
-  default_renderer,
-  default_set_attr,
-  parser as createParser,
-  parser_end,
-  parser_write
-} from "streaming-markdown";
+import { Children, isValidElement } from "react";
+import ReactMarkdown from "react-markdown";
+import rehypeHighlight from "rehype-highlight";
+import rehypeKatex from "rehype-katex";
+import rehypeRaw from "rehype-raw";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import "highlight.js/styles/github.css";
+import "katex/dist/katex.min.css";
 
-function createCompositeRenderer(container, sink) {
-  const domRenderer = default_renderer(container);
-  const sinkRenderer = sink?.renderer ?? null;
+function flattenText(node) {
+  if (typeof node === "string" || typeof node === "number") {
+    return String(node);
+  }
 
-  return {
-    data: {
-      dom: domRenderer.data,
-      sink: sinkRenderer?.data ?? null
-    },
-    add_token(data, type) {
-      default_add_token(data.dom, type);
-      sinkRenderer?.add_token?.(data.sink, type);
-    },
-    end_token(data) {
-      default_end_token(data.dom);
-      sinkRenderer?.end_token?.(data.sink);
-    },
-    add_text(data, text) {
-      default_add_text(data.dom, text);
-      sinkRenderer?.add_text?.(data.sink, text);
-    },
-    set_attr(data, type, value) {
-      default_set_attr(data.dom, type, value);
-      sinkRenderer?.set_attr?.(data.sink, type, value);
-    }
-  };
+  if (Array.isArray(node)) {
+    return node.map((item) => flattenText(item)).join("");
+  }
+
+  if (isValidElement(node)) {
+    return flattenText(node.props?.children);
+  }
+
+  return "";
 }
 
-function resetParserState(container, parserRef, renderedRef, endedRef, sinkRef) {
-  container.innerHTML = "";
-  parserRef.current = createParser(createCompositeRenderer(container, sinkRef.current));
-  renderedRef.current = "";
-  endedRef.current = false;
-}
+export default function StreamingMarkdown({ content, streaming }) {
+  const markdown = String(content ?? "");
 
-export default function StreamingMarkdown({ content, streaming, sink = null }) {
-  const containerRef = useRef(null);
-  const parserRef = useRef(null);
-  const renderedContentRef = useRef("");
-  const endedRef = useRef(false);
-  const sinkRef = useRef(sink);
-
-  useEffect(() => {
-    sinkRef.current = sink;
-  }, [sink]);
-
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container) {
-      return;
-    }
-
-    const nextContent = String(content ?? "");
-    if (!parserRef.current) {
-      resetParserState(
-        container,
-        parserRef,
-        renderedContentRef,
-        endedRef,
-        sinkRef
-      );
-    }
-
-    if (!nextContent.startsWith(renderedContentRef.current)) {
-      resetParserState(
-        container,
-        parserRef,
-        renderedContentRef,
-        endedRef,
-        sinkRef
-      );
-    }
-
-    const delta = nextContent.slice(renderedContentRef.current.length);
-    if (delta) {
-      parser_write(parserRef.current, delta);
-      renderedContentRef.current = nextContent;
-    }
-
-    if (!streaming && !endedRef.current) {
-      parser_end(parserRef.current);
-      sinkRef.current?.finish?.();
-      endedRef.current = true;
-    }
-  }, [content, streaming, sink]);
-
-  useEffect(() => {
-    return () => {
-      parserRef.current = null;
-      renderedContentRef.current = "";
-      endedRef.current = false;
-    };
-  }, []);
-
-  if (!content) {
+  if (!markdown) {
     return <div className="bubble-placeholder">{streaming ? "..." : ""}</div>;
   }
 
-  return <div ref={containerRef} className="bubble-markdown" />;
+  return (
+    <div className="bubble-markdown">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeRaw, rehypeKatex, rehypeHighlight]}
+        components={{
+          a(props) {
+            return <a {...props} target="_blank" rel="noreferrer" />;
+          },
+          code({ className, children, node, ...props }) {
+            const value = flattenText(Children.toArray(children));
+            const isBlock = /\blanguage-/.test(className || "") || value.includes("\n");
+
+            if (isBlock) {
+              return (
+                <code className={className} {...props}>
+                  {value.replace(/\n$/, "")}
+                </code>
+              );
+            }
+
+            return (
+              <code {...props}>
+                {value}
+              </code>
+            );
+          }
+        }}
+      >
+        {markdown}
+      </ReactMarkdown>
+    </div>
+  );
 }

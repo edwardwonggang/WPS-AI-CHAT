@@ -27,11 +27,18 @@ import {
   STRONG_UND,
   TABLE,
   TABLE_CELL,
-  TABLE_ROW
+  TABLE_ROW,
+  parser as createParser,
+  parser_end,
+  parser_write
 } from "streaming-markdown";
 
-const FLUSH_INTERVAL_MS = 32;
-const MAX_PENDING_CHARS = 320;
+const FLUSH_INTERVAL_MS = 12;
+const MAX_PENDING_CHARS = 160;
+const ALIGN_LEFT = 0;
+const ALIGN_CENTER = 1;
+const ALIGN_JUSTIFY = 3;
+const LINE_SPACING_EXACTLY = 4;
 const HEADING_SIZES = {
   [HEADING_1]: 18,
   [HEADING_2]: 16,
@@ -40,6 +47,52 @@ const HEADING_SIZES = {
   [HEADING_5]: 13,
   [HEADING_6]: 13
 };
+const HEADING_LEVELS = {
+  [HEADING_1]: 1,
+  [HEADING_2]: 2,
+  [HEADING_3]: 3,
+  [HEADING_4]: 4,
+  [HEADING_5]: 5,
+  [HEADING_6]: 6
+};
+const HEADING_SIZE_BY_LEVEL = {
+  1: 18,
+  2: 16,
+  3: 15,
+  4: 14,
+  5: 13,
+  6: 13
+};
+const PAPER_BODY_STYLE = Object.freeze({
+  name: "SimSun",
+  nameAscii: "Times New Roman",
+  size: 12
+});
+const PAPER_BODY_LINE_SPACING = 28;
+const PAPER_HEADING_LINE_SPACING = 24;
+const PAPER_CODE_LINE_SPACING = 18;
+const PAPER_EQUATION_LINE_SPACING = 21;
+const PAPER_PARAGRAPH_INDENT_CHARS = 2;
+const RAW_BREAK_PLACEHOLDER = "WPS-BR-PLACEHOLDER-ZXCV";
+const RAW_CHECKED_PLACEHOLDER = "WPSCHECKEDBOXPLACEHOLDERZXCV";
+const RAW_UNCHECKED_PLACEHOLDER = "WPSUNCHECKEDBOXPLACEHOLDERZXCV";
+const RAW_SUP_START = "WPSSUPSTARTZXCV";
+const RAW_SUP_END = "WPSSUPENDZXCV";
+const RAW_SUB_START = "WPSSUBSTARTZXCV";
+const RAW_SUB_END = "WPSSUBENDZXCV";
+const RAW_EQUATION_START = "WPSDISPLAYMATHSTARTZXCV";
+const RAW_EQUATION_END = "WPSDISPLAYMATHENDZXCV";
+const RAW_TOKEN_MARKERS = [
+  RAW_BREAK_PLACEHOLDER,
+  RAW_CHECKED_PLACEHOLDER,
+  RAW_UNCHECKED_PLACEHOLDER,
+  RAW_SUP_START,
+  RAW_SUP_END,
+  RAW_SUB_START,
+  RAW_SUB_END,
+  RAW_EQUATION_START,
+  RAW_EQUATION_END
+];
 
 const INLINE_DEFAULTS = Object.freeze({
   bold: false,
@@ -124,6 +177,10 @@ function captureBaseStyle(range) {
   };
 }
 
+function createPaperBodyStyle() {
+  return { ...PAPER_BODY_STYLE };
+}
+
 function applyBaseStyle(range, baseStyle) {
   const font = range.Font;
 
@@ -152,14 +209,721 @@ function applyBaseStyle(range, baseStyle) {
   }
 }
 
+function currentOutputOffset(state) {
+  return state.position + state.pendingChars;
+}
+
+function setFontFamily(font, name, nameAscii = name) {
+  if (!name) {
+    return;
+  }
+
+  font.Name = name;
+
+  if (nameAscii) {
+    font.NameAscii = nameAscii;
+  }
+
+  try {
+    font.NameFarEast = name;
+  } catch {
+    // Some hosts may not expose Far East font names.
+  }
+}
+
+function setParagraphNumeric(paragraph, key, value) {
+  try {
+    paragraph[key] = value;
+  } catch {
+    // Some hosts may not expose every paragraph property.
+  }
+}
+
+function forEachParagraph(range, applyParagraph) {
+  try {
+    const paragraphs = range?.Paragraphs;
+    const count = Number(paragraphs?.Count ?? 0);
+
+    if (count > 0) {
+      for (let index = 1; index <= count; index += 1) {
+        const paragraphRange = paragraphs.Item(index)?.Range;
+        const paragraph = paragraphRange?.ParagraphFormat;
+        if (paragraphRange && paragraph) {
+          applyParagraph(paragraphRange, paragraph);
+        }
+      }
+      return;
+    }
+  } catch {
+    // Fall back to the range paragraph format below.
+  }
+
+  const paragraph = range?.ParagraphFormat;
+  if (paragraph) {
+    applyParagraph(range, paragraph);
+  }
+}
+
+function getRangeTextSafe(doc, start, end) {
+  try {
+    return String(doc.Range(start, end).Text || "");
+  } catch {
+    return "";
+  }
+}
+
+function resolveDocumentAppendAnchor(doc) {
+  const contentEnd = Number(doc?.Content?.End ?? 0);
+  return Math.max(0, contentEnd > 0 ? contentEnd - 1 : 0);
+}
+
+function createBlockMeta(state, type) {
+  const quoteDepth = state.stack.filter((entry) => entry.type === BLOCKQUOTE).length;
+  const listDepth = state.stack.filter((entry) => entry.type === LIST_ITEM).length;
+
+  switch (type) {
+    case PARAGRAPH:
+      if (listDepth > 0) {
+        return null;
+      }
+      return {
+        kind: quoteDepth > 0 ? "quote" : "paragraph"
+      };
+    case LIST_ITEM:
+      return {
+        kind: "list",
+        depth: listDepth + 1,
+        quoteDepth
+      };
+    case HEADING_1:
+    case HEADING_2:
+    case HEADING_3:
+    case HEADING_4:
+    case HEADING_5:
+    case HEADING_6:
+      return {
+        kind: "heading",
+        level: HEADING_LEVELS[type]
+      };
+    case CODE_BLOCK:
+    case CODE_FENCE:
+      return {
+        kind: "code"
+      };
+    case EQUATION_BLOCK:
+      return {
+        kind: "equation"
+      };
+    case RULE:
+      return {
+        kind: "rule"
+      };
+    default:
+      return null;
+  }
+}
+
+function beginBlock(state, context) {
+  const meta = createBlockMeta(state, context.type);
+  if (!meta) {
+    return;
+  }
+
+  context.blockMeta = meta;
+  context.blockStart = currentOutputOffset(state);
+}
+
+function finishBlock(state, context) {
+  if (!context?.blockMeta) {
+    return;
+  }
+
+  const end = currentOutputOffset(state);
+  if (end <= context.blockStart) {
+    return;
+  }
+
+  state.blocks.push({
+    ...context.blockMeta,
+    end,
+    start: context.blockStart
+  });
+}
+
+function applyHeadingFormat(range, level) {
+  const font = range.Font;
+  setFontFamily(font, "SimHei", "Times New Roman");
+  font.Bold = 1;
+
+  if (HEADING_SIZE_BY_LEVEL[level]) {
+    font.Size = HEADING_SIZE_BY_LEVEL[level];
+  }
+
+  forEachParagraph(range, (_paragraphRange, paragraph) => {
+    setParagraphNumeric(paragraph, "Alignment", level === 1 ? ALIGN_CENTER : ALIGN_LEFT);
+    setParagraphNumeric(paragraph, "CharacterUnitFirstLineIndent", 0);
+    setParagraphNumeric(paragraph, "CharacterUnitLeftIndent", 0);
+    setParagraphNumeric(paragraph, "LineSpacingRule", LINE_SPACING_EXACTLY);
+    setParagraphNumeric(paragraph, "LineSpacing", PAPER_HEADING_LINE_SPACING);
+    setParagraphNumeric(paragraph, "SpaceBefore", level === 1 ? 12 : 6);
+    setParagraphNumeric(paragraph, "SpaceAfter", level === 1 ? 12 : 6);
+  });
+}
+
+function applyParagraphFormat(range, kind, depth = 0) {
+  let leftIndent = 0;
+  let firstLineIndent = 0;
+
+  if (kind === "paragraph") {
+    firstLineIndent = PAPER_PARAGRAPH_INDENT_CHARS;
+  } else if (kind === "list") {
+    leftIndent = Math.max(1, depth) * 2;
+    firstLineIndent = -2;
+  } else if (kind === "quote") {
+    leftIndent = 2;
+  }
+
+  forEachParagraph(range, (_paragraphRange, paragraph) => {
+    setParagraphNumeric(paragraph, "Alignment", ALIGN_LEFT);
+    setParagraphNumeric(paragraph, "CharacterUnitLeftIndent", leftIndent);
+    setParagraphNumeric(paragraph, "CharacterUnitFirstLineIndent", firstLineIndent);
+    setParagraphNumeric(paragraph, "LineSpacingRule", LINE_SPACING_EXACTLY);
+    setParagraphNumeric(paragraph, "LineSpacing", PAPER_BODY_LINE_SPACING);
+    setParagraphNumeric(paragraph, "SpaceBefore", 0);
+    setParagraphNumeric(paragraph, "SpaceAfter", kind === "table" ? 3 : 0);
+  });
+}
+
+function applyCodeFormat(range) {
+  const font = range.Font;
+  setFontFamily(font, "Consolas", "Consolas");
+  font.Size = 10.5;
+
+  forEachParagraph(range, (_paragraphRange, paragraph) => {
+    setParagraphNumeric(paragraph, "Alignment", ALIGN_LEFT);
+    setParagraphNumeric(paragraph, "CharacterUnitLeftIndent", 0);
+    setParagraphNumeric(paragraph, "CharacterUnitFirstLineIndent", 0);
+    setParagraphNumeric(paragraph, "LineSpacingRule", LINE_SPACING_EXACTLY);
+    setParagraphNumeric(paragraph, "LineSpacing", PAPER_CODE_LINE_SPACING);
+    setParagraphNumeric(paragraph, "SpaceBefore", 6);
+    setParagraphNumeric(paragraph, "SpaceAfter", 6);
+  });
+}
+
+function applyEquationFormat(range) {
+  const font = range.Font;
+  setFontFamily(font, "Cambria Math", "Cambria Math");
+  font.Italic = 0;
+
+  forEachParagraph(range, (_paragraphRange, paragraph) => {
+    setParagraphNumeric(paragraph, "Alignment", ALIGN_CENTER);
+    setParagraphNumeric(paragraph, "CharacterUnitLeftIndent", 0);
+    setParagraphNumeric(paragraph, "CharacterUnitFirstLineIndent", 0);
+    setParagraphNumeric(paragraph, "LineSpacingRule", LINE_SPACING_EXACTLY);
+    setParagraphNumeric(paragraph, "LineSpacing", PAPER_EQUATION_LINE_SPACING);
+    setParagraphNumeric(paragraph, "SpaceBefore", 6);
+    setParagraphNumeric(paragraph, "SpaceAfter", 6);
+  });
+}
+
+function applyBaseParagraphFormat(range) {
+  forEachParagraph(range, (_paragraphRange, paragraph) => {
+    setParagraphNumeric(paragraph, "Alignment", ALIGN_LEFT);
+    setParagraphNumeric(paragraph, "CharacterUnitLeftIndent", 0);
+    setParagraphNumeric(paragraph, "CharacterUnitFirstLineIndent", 0);
+    setParagraphNumeric(paragraph, "LineSpacingRule", LINE_SPACING_EXACTLY);
+    setParagraphNumeric(paragraph, "LineSpacing", PAPER_BODY_LINE_SPACING);
+    setParagraphNumeric(paragraph, "SpaceBefore", 0);
+    setParagraphNumeric(paragraph, "SpaceAfter", 0);
+  });
+}
+
+function applyBaseRangeFormat(state, start, end) {
+  if (!state.startedWriting || end <= start) {
+    return;
+  }
+
+  try {
+    const range = state.doc.Range(start, end);
+    applyBaseStyle(range, state.writeStyle);
+    applyBaseParagraphFormat(range);
+  } catch (error) {
+    state.debugError = `table:${error?.message || error}`;
+    state.disabled = true;
+  }
+}
+
+function activeTableContext(state) {
+  return findLastContext(state, (entry) => entry.type === TABLE);
+}
+
+function activeTableRowContext(state) {
+  return findLastContext(state, (entry) => entry.type === TABLE_ROW);
+}
+
+function activeTableCellContext(state) {
+  return findLastContext(state, (entry) => entry.type === TABLE_CELL);
+}
+
+function insertWpsTable(state, tableContext) {
+  const rows = tableContext?.rows ?? [];
+  if (rows.length === 0) {
+    return;
+  }
+
+  const columnCount = rows.reduce(
+    (max, row) => Math.max(max, Array.isArray(row) ? row.length : 0),
+    0
+  );
+
+  if (columnCount === 0) {
+    return;
+  }
+
+  flushPending(state);
+  ensureWriteTarget(state);
+
+  const start = state.anchor + state.position;
+
+  try {
+    const insertionRange = state.doc.Range(start, start);
+    let table = null;
+
+    try {
+      table = state.doc.Tables.Add(insertionRange, rows.length, columnCount);
+    } catch (error) {
+      state.debugError = `table:add-doc:${error?.message || error}`;
+    }
+
+    if (!table) {
+      try {
+        const app = getApplication();
+        const activeDoc = app?.ActiveDocument;
+        if (activeDoc?.Tables?.Add) {
+          table = activeDoc.Tables.Add(activeDoc.Range(start, start), rows.length, columnCount);
+        }
+      } catch (error) {
+        state.debugError = `table:add-active:${error?.message || error}`;
+      }
+    }
+
+    if (!table) {
+      const app = getApplication();
+      try {
+        app?.Selection?.SetRange(start, start);
+        const selectionRange = getSelectionRange(app);
+        const activeDoc = app?.ActiveDocument;
+        if (selectionRange && activeDoc?.Tables?.Add) {
+          table = activeDoc.Tables.Add(selectionRange, rows.length, columnCount);
+        }
+      } catch (error) {
+        state.debugError = `table:add-selection:${error?.message || error}`;
+      }
+    }
+
+    if (!table) {
+      throw new Error(
+        `unable to add table rows=${rows.length} cols=${columnCount}`
+      );
+    }
+
+    try {
+      table.Borders.Enable = 1;
+    } catch {
+      // Some hosts may not expose Borders.Enable.
+    }
+
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+      const row = rows[rowIndex] || [];
+
+      for (let columnIndex = 0; columnIndex < columnCount; columnIndex += 1) {
+        const cellRange = table.Cell(rowIndex + 1, columnIndex + 1).Range;
+        const cellText = normalizeTableCellText(row[columnIndex] ?? "");
+
+        cellRange.Text = cellText;
+        applyBaseStyle(cellRange, state.writeStyle);
+        applyBaseParagraphFormat(cellRange);
+
+        if (rowIndex === 0) {
+          cellRange.Font.Bold = 1;
+        }
+      }
+    }
+
+    state.position = Math.max(state.position, Number(table.Range.End) - state.anchor);
+    state.lineStart = true;
+    state.trailingBreaks = 1;
+  } catch (error) {
+    state.debugError = `table:final:${error?.message || error}`;
+    state.lineStart = true;
+    state.trailingBreaks = Math.max(state.trailingBreaks, 1);
+  }
+}
+
+function applyPendingBlockFormats(state) {
+  if (
+    !state.startedWriting ||
+    state.position <= 0 ||
+    state.formattedBlockCount >= state.blocks.length
+  ) {
+    return;
+  }
+
+  const pendingBlocks = state.blocks.slice(state.formattedBlockCount);
+  const orderedBlocks = [
+    ...pendingBlocks.filter((block) => block.kind !== "equation"),
+    ...pendingBlocks.filter((block) => block.kind === "equation")
+  ];
+
+  for (const block of orderedBlocks) {
+    const start = state.anchor + block.start;
+    let end = state.anchor + block.end;
+    const trailingText = getRangeTextSafe(state.doc, end, end + 1);
+
+    if (trailingText === "\r" || trailingText === "\n") {
+      end += 1;
+    }
+
+    if (end <= start) {
+      continue;
+    }
+
+    try {
+      const range = state.doc.Range(start, end);
+
+      if (block.kind === "heading") {
+        applyHeadingFormat(range, block.level);
+        continue;
+      }
+
+      if (block.kind === "code") {
+        applyCodeFormat(range);
+        continue;
+      }
+
+      if (block.kind === "equation") {
+        applyEquationFormat(range);
+        continue;
+      }
+
+      applyParagraphFormat(range, block.kind, block.depth || 0);
+    } catch {
+      state.disabled = true;
+      return;
+    }
+  }
+
+  state.formattedBlockCount = state.blocks.length;
+}
+
+function applyInsertedBlockFormats(state) {
+  state.formattedBlockCount = 0;
+  applyPendingBlockFormats(state);
+}
+
 function normalizeNewlines(text) {
-  return String(text ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  return String(text ?? "")
+    .replace(new RegExp(RAW_BREAK_PLACEHOLDER, "g"), "\n")
+    .replace(new RegExp(RAW_CHECKED_PLACEHOLDER, "g"), "\u2611 ")
+    .replace(new RegExp(RAW_UNCHECKED_PLACEHOLDER, "g"), "\u2610 ")
+    .replace(new RegExp(`${RAW_SUP_START}(.*?)${RAW_SUP_END}`, "g"), "[$1]")
+    .replace(new RegExp(`${RAW_SUB_START}(.*?)${RAW_SUB_END}`, "g"), "_$1")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#39;/gi, "'")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<sup[^>]*>(.*?)<\/sup>/gi, "[$1]")
+    .replace(/<sub[^>]*>(.*?)<\/sub>/gi, "_$1")
+    .replace(/<\/(p|div|section|article|blockquote|h[1-6]|pre|ul|ol)>/gi, "\n")
+    .replace(/<\/li>/gi, "\n")
+    .replace(/<(li)(\s[^>]*)?>/gi, "• ")
+    .replace(/<input[^>]*type=["']checkbox["'][^>]*checked[^>]*>/gi, "☑ ")
+    .replace(/<input[^>]*type=["']checkbox["'][^>]*>/gi, "☐ ")
+    .replace(/<\/(td|th)>/gi, "\t")
+    .replace(/<\/tr>/gi, "\n")
+    .replace(/<hr\s*\/?>/gi, "\n────────────────\n")
+    .replace(/<(strong|b)>/gi, "")
+    .replace(/<\/(strong|b)>/gi, "")
+    .replace(/<(em|i)>/gi, "")
+    .replace(/<\/(em|i)>/gi, "")
+    .replace(/<(code|pre)>/gi, "")
+    .replace(/<\/(code|pre)>/gi, "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+}
+
+function normalizeMarkdownInput(text) {
+  return String(text ?? "")
+    .replace(/(^|\n)\s*\$\$([\s\S]*?)\$\$\s*(?=\n|$)/g, (_match, prefix, value) => {
+      const body = String(value ?? "").trim();
+      return `${prefix}${RAW_EQUATION_START}${body}${RAW_EQUATION_END}\n`;
+    })
+    .replace(/<br\s*\/?>/gi, RAW_BREAK_PLACEHOLDER)
+    .replace(/<input[^>]*type=["']checkbox["'][^>]*checked[^>]*>/gi, `${RAW_CHECKED_PLACEHOLDER} `)
+    .replace(/<input[^>]*type=["']checkbox["'][^>]*>/gi, `${RAW_UNCHECKED_PLACEHOLDER} `)
+    .replace(/<sup[^>]*>(.*?)<\/sup>/gi, `${RAW_SUP_START}$1${RAW_SUP_END}`)
+    .replace(/<sub[^>]*>(.*?)<\/sub>/gi, `${RAW_SUB_START}$1${RAW_SUB_END}`)
+    .replace(/<(li)(\s[^>]*)?>/gi, "- ")
+    .replace(/<\/li>/gi, "\n")
+    .replace(/<\/?(ul|ol|p|div|section|article|blockquote)[^>]*>/gi, "\n")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&#39;/gi, "'")
+    .replace(/&quot;/gi, "\"");
+}
+
+function normalizeTableCellText(text) {
+  return normalizeNewlines(text)
+    .replace(/\s*\|\s*$/, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .trim();
+}
+
+function parseMarkdownTableBlock(block) {
+  const lines = String(block ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length < 2) {
+    return null;
+  }
+
+  const separator = lines[1];
+  if (!/^\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?$/.test(separator)) {
+    return null;
+  }
+
+  const rows = lines
+    .filter((line, index) => index !== 1)
+    .map((line) =>
+      line
+        .replace(/^\|/, "")
+        .replace(/\|$/, "")
+        .split("|")
+        .map((cell) => cell.trim())
+    )
+    .filter((row) => row.length > 0);
+
+  return rows.length >= 2 ? rows : null;
+}
+
+function extractMarkdownTables(text) {
+  const lines = String(text ?? "").split(/\r?\n/);
+  const tables = [];
+  let buffer = [];
+  let inCodeFence = false;
+
+  function flushBuffer() {
+    if (buffer.length === 0) {
+      return;
+    }
+
+    const parsed = parseMarkdownTableBlock(buffer.join("\n"));
+    if (parsed) {
+      tables.push(parsed);
+    }
+    buffer = [];
+  }
+
+  for (const line of lines) {
+    if (/^\s*```/.test(line)) {
+      inCodeFence = !inCodeFence;
+      flushBuffer();
+      continue;
+    }
+
+    if (inCodeFence) {
+      flushBuffer();
+      continue;
+    }
+
+    if (/^\s*\|.*\|\s*$/.test(line)) {
+      buffer.push(line);
+      continue;
+    }
+
+    flushBuffer();
+  }
+
+  flushBuffer();
+  return tables;
+}
+
+function insertMarkdownTableFallbacks(state) {
+  const currentCount = Number(state.doc?.Tables?.Count ?? 0);
+  if (currentCount > state.initialTableCount) {
+    return;
+  }
+
+  const tables = extractMarkdownTables(state.rawMarkdown);
+  if (tables.length === 0) {
+    return;
+  }
+
+  for (const rows of tables) {
+    insertWpsTable(state, { rows });
+    if (!state.disabled) {
+      ensureBreaks(state, 1);
+    }
+  }
+}
+
+function insertEquationFallback(state, equationText) {
+  const normalized = normalizeNewlines(equationText).trim();
+  if (!normalized || state.cancelled || state.disabled) {
+    return;
+  }
+
+  if ((state.position > 0 || state.pendingChars > 0) && state.trailingBreaks === 0) {
+    ensureBreaks(state, 1);
+  }
+
+  const start = currentOutputOffset(state);
+  queueText(state, normalized, INLINE_DEFAULTS, true);
+  ensureBreaks(state, 1);
+
+  const end = currentOutputOffset(state);
+  if (end > start) {
+    state.blocks.push({
+      kind: "equation",
+      start,
+      end
+    });
+  }
+}
+
+function splitPlaceholderCarry(text) {
+  const source = String(text ?? "");
+  if (!source) {
+    return {
+      carry: "",
+      safeText: ""
+    };
+  }
+
+  let carryIndex = -1;
+
+  for (const marker of RAW_TOKEN_MARKERS) {
+    const markerLength = marker.length;
+    for (let size = 1; size < markerLength; size += 1) {
+      if (source.endsWith(marker.slice(0, size))) {
+        carryIndex = Math.max(carryIndex, source.length - size);
+      }
+    }
+  }
+
+  for (const [startMarker, endMarker] of [
+    [RAW_SUP_START, RAW_SUP_END],
+    [RAW_SUB_START, RAW_SUB_END],
+    [RAW_EQUATION_START, RAW_EQUATION_END]
+  ]) {
+    const startIndex = source.lastIndexOf(startMarker);
+    if (startIndex >= 0 && source.indexOf(endMarker, startIndex + startMarker.length) === -1) {
+      carryIndex = Math.max(carryIndex, startIndex);
+    }
+  }
+
+  if (carryIndex < 0) {
+    return {
+      carry: "",
+      safeText: source
+    };
+  }
+
+  return {
+    carry: source.slice(carryIndex),
+    safeText: source.slice(0, carryIndex)
+  };
+}
+
+function flushPlaceholderCarry(state) {
+  if (!state.rawTextCarry) {
+    return;
+  }
+
+  const remaining = state.rawTextCarry;
+  state.rawTextCarry = "";
+  appendText(state, remaining);
+
+  if (state.rawTextCarry) {
+    const unresolved = normalizeNewlines(state.rawTextCarry);
+    state.rawTextCarry = "";
+    if (unresolved) {
+      appendText(state, unresolved);
+    }
+  }
 }
 
 function updateLineState(state, text) {
   const trailingMatch = String(text).match(/\r+$/);
   state.trailingBreaks = trailingMatch ? trailingMatch[0].length : 0;
   state.lineStart = state.trailingBreaks > 0;
+}
+
+function insertDirectText(state, text, style = null) {
+  const normalized = String(text ?? "");
+  if (!normalized || state.cancelled || state.disabled) {
+    return;
+  }
+
+  const start = state.anchor + state.position;
+  const end = start + normalized.length;
+
+  state.doc.Range(start, start).InsertAfter(normalized);
+
+  const range = state.doc.Range(start, end);
+  applyBaseStyle(range, state.writeStyle);
+  applyBaseParagraphFormat(range);
+
+  if (style && !isDefaultStyle(style)) {
+    applyTextStyle(range, style);
+  }
+
+  state.position += normalized.length;
+  updateLineState(state, normalized);
+}
+
+function ensureLeadingBreak(state) {
+  if (state.replaceSelection || state.position > 0 || state.anchor <= 0) {
+    return;
+  }
+
+  let previousText = "";
+  try {
+    previousText = String(state.doc.Range(state.anchor - 1, state.anchor).Text || "");
+  } catch {
+    previousText = "";
+  }
+
+  if (!previousText || previousText === "\r" || previousText === "\n") {
+    return;
+  }
+
+  insertDirectText(state, "\r");
+}
+
+function restoreCaretStyle(state) {
+  const app = getApplication();
+  const caret = state.doc.Range(state.anchor + state.position, state.anchor + state.position);
+
+  applyBaseStyle(caret, state.baseStyle);
+
+  try {
+    app?.Selection?.SetRange(state.anchor + state.position, state.anchor + state.position);
+    const selectionRange = getSelectionRange(app);
+    if (selectionRange) {
+      applyBaseStyle(selectionRange, state.baseStyle);
+    }
+  } catch {
+    // Some hosts may not expose a mutable selection range.
+  }
 }
 
 function ensureWriteTarget(state) {
@@ -171,6 +935,7 @@ function ensureWriteTarget(state) {
     state.doc.Range(state.selectionStart, state.selectionEnd).Text = "";
   }
 
+  ensureLeadingBreak(state);
   state.startedWriting = true;
 }
 
@@ -201,7 +966,7 @@ function flushPending(state) {
 
     const batchEnd = batchStart + batchText.length;
     const batchRange = state.doc.Range(batchStart, batchEnd);
-    applyBaseStyle(batchRange, state.baseStyle);
+    applyBaseStyle(batchRange, state.writeStyle);
 
     let offset = 0;
     for (const run of runs) {
@@ -217,6 +982,8 @@ function flushPending(state) {
     }
 
     state.position += batchText.length;
+    applyBaseRangeFormat(state, batchStart, batchEnd);
+    applyPendingBlockFormats(state);
   } catch {
     state.disabled = true;
   }
@@ -340,32 +1107,6 @@ function currentTextStyle(state) {
   return style;
 }
 
-function shouldIndentParagraph(state) {
-  const hasParagraph = state.stack.some((entry) => entry.type === PARAGRAPH);
-  if (!hasParagraph) {
-    return false;
-  }
-
-  return !state.stack.some(
-    (entry) =>
-      entry.type === BLOCKQUOTE ||
-      entry.type === LIST_ITEM ||
-      entry.type === LIST_ORDERED ||
-      entry.type === LIST_UNORDERED ||
-      entry.type === HEADING_1 ||
-      entry.type === HEADING_2 ||
-      entry.type === HEADING_3 ||
-      entry.type === HEADING_4 ||
-      entry.type === HEADING_5 ||
-      entry.type === HEADING_6 ||
-      entry.type === CODE_BLOCK ||
-      entry.type === CODE_FENCE ||
-      entry.type === TABLE ||
-      entry.type === TABLE_ROW ||
-      entry.type === TABLE_CELL
-  );
-}
-
 function consumeLinePrefix(state) {
   if (!state.lineStart || state.cancelled || state.disabled) {
     return;
@@ -389,18 +1130,47 @@ function consumeLinePrefix(state) {
     listItem.prefixPending = false;
   }
 
-  if (!prefix && shouldIndentParagraph(state)) {
-    prefix = "  ";
-  }
-
   if (prefix) {
     queueText(state, prefix, currentTextStyle(state));
   }
 }
 
 function appendText(state, text) {
-  const normalized = normalizeNewlines(text);
+  const combined = `${state.rawTextCarry || ""}${String(text ?? "")}`;
+  const { carry, safeText } = splitPlaceholderCarry(combined);
+  state.rawTextCarry = carry;
+
+  const normalized = normalizeNewlines(safeText);
   if (!normalized || state.disabled) {
+    return;
+  }
+
+  const equationPattern = new RegExp(`${RAW_EQUATION_START}(.*?)${RAW_EQUATION_END}`, "g");
+  let cursor = 0;
+  let match = equationPattern.exec(normalized);
+
+  if (match) {
+    do {
+      const plainText = normalized.slice(cursor, match.index);
+      if (plainText) {
+        appendText(state, plainText);
+      }
+
+      insertEquationFallback(state, match[1]);
+      cursor = match.index + match[0].length;
+      match = equationPattern.exec(normalized);
+    } while (match);
+
+    const tail = normalized.slice(cursor);
+    if (tail) {
+      appendText(state, tail);
+    }
+    return;
+  }
+
+  const tableCell = activeTableCellContext(state);
+  if (tableCell) {
+    tableCell.text = `${tableCell.text || ""}${normalized}`;
     return;
   }
 
@@ -433,26 +1203,22 @@ function pushToken(state, type) {
       if (state.position > 0 || state.pendingChars > 0) {
         ensureBreaks(state, 1);
       }
-      context.rowCount = 0;
+      context.rows = [];
       break;
     case TABLE_ROW: {
-      const table = findLastContext(state, (entry) => entry.type === TABLE);
-      if (table?.rowCount > 0 && state.trailingBreaks === 0) {
-        ensureBreaks(state, 1);
-      }
+      const table = activeTableContext(state);
       if (table) {
-        table.rowCount += 1;
+        table.rows.push([]);
       }
-      context.cellCount = 0;
       break;
     }
     case TABLE_CELL: {
-      const row = findLastContext(state, (entry) => entry.type === TABLE_ROW);
-      if (row?.cellCount > 0) {
-        queueText(state, "\t", INLINE_DEFAULTS);
-      }
-      if (row) {
-        row.cellCount += 1;
+      const row = activeTableRowContext(state);
+      const table = activeTableContext(state);
+      const currentRow = table?.rows?.[table.rows.length - 1];
+      context.text = "";
+      if (row && currentRow) {
+        currentRow.push("");
       }
       break;
     }
@@ -492,6 +1258,7 @@ function pushToken(state, type) {
       break;
   }
 
+  beginBlock(state, context);
   state.stack.push(context);
 
   if (type === RULE) {
@@ -505,6 +1272,22 @@ function popToken(state) {
   const context = state.stack.pop();
   if (!context) {
     return;
+  }
+
+  if (context.type === TABLE_CELL) {
+    const table = activeTableContext(state);
+    const currentRow = table?.rows?.[table.rows.length - 1];
+    if (currentRow && currentRow.length > 0) {
+      currentRow[currentRow.length - 1] = context.text || "";
+    }
+  } else if (context.type === TABLE) {
+    insertWpsTable(state, context);
+  } else {
+    finishBlock(state, context);
+  }
+
+  if (state.pendingChars === 0) {
+    applyPendingBlockFormats(state);
   }
 
   if (context.type === CHECKBOX) {
@@ -543,15 +1326,19 @@ function setTokenAttr(state, type, value) {
 function createPreviewSink(label) {
   return {
     locationLabel: label,
-    renderer: {
-      data: null,
-      add_token() {},
-      end_token() {},
-      add_text() {},
-      set_attr() {}
-    },
+    write() {},
     finish() {},
     cancel() {}
+  };
+}
+
+function createSinkRenderer(state) {
+  return {
+    data: state,
+    add_token: pushToken,
+    end_token: popToken,
+    add_text: appendText,
+    set_attr: setTokenAttr
   };
 }
 
@@ -588,7 +1375,7 @@ export function readDocumentInfo() {
     return null;
   }
 
-  const title = String(doc.Name ?? "").trim() || "未命名文档";
+  const title = String(doc.Name ?? "").trim() || "Untitled Document";
   const path = String(doc.Path ?? "").trim();
   let fullName = String(doc.FullName ?? "").trim();
 
@@ -628,10 +1415,11 @@ export function createWpsMarkdownSink({ replaceSelection } = {}) {
   }
 
   const baseStyle = captureBaseStyle(selectionRange);
+  const writeStyle = createPaperBodyStyle();
   const selectionStart = Number(selectionRange.Start);
   const selectionEnd = Number(selectionRange.End);
   const originalText = String(selectionRange.Text || "");
-  const anchor = replaceSelection ? selectionStart : selectionEnd;
+  const anchor = resolveDocumentAppendAnchor(doc);
 
   const rendererState = {
     anchor,
@@ -640,32 +1428,68 @@ export function createWpsMarkdownSink({ replaceSelection } = {}) {
     disabled: false,
     doc,
     flushTimer: null,
+    initialTableCount: Number(doc?.Tables?.Count ?? 0),
     lineStart: true,
+    blocks: [],
     pendingChars: 0,
     pendingRuns: [],
     position: 0,
+    formattedBlockCount: 0,
     replaceSelection: Boolean(replaceSelection),
+    rawMarkdown: "",
+    rawTextCarry: "",
+    debugError: "",
     selectionEnd,
     selectionStart,
     stack: [],
     startedWriting: false,
-    trailingBreaks: 0
+    trailingBreaks: 0,
+    writeStyle
   };
+  const parser = createParser(createSinkRenderer(rendererState));
+  let ended = false;
 
   return {
+    debugState: rendererState,
     locationLabel: replaceSelection ? "Replace selection" : "Insert at cursor",
-    renderer: {
-      data: rendererState,
-      add_token: pushToken,
-      end_token: popToken,
-      add_text: appendText,
-      set_attr: setTokenAttr
+    write(chunk) {
+      if (rendererState.cancelled || rendererState.disabled || ended) {
+        return;
+      }
+
+      const text = normalizeMarkdownInput(chunk);
+      if (!text) {
+        return;
+      }
+
+      rendererState.rawMarkdown += String(chunk ?? "");
+      parser_write(parser, text);
     },
     finish() {
+      if (rendererState.cancelled || ended) {
+        return;
+      }
+
+      parser_end(parser);
+      ended = true;
+      flushPlaceholderCarry(rendererState);
       flushPending(rendererState);
+      if (
+        !rendererState.cancelled &&
+        !rendererState.disabled &&
+        rendererState.startedWriting &&
+        !rendererState.replaceSelection &&
+        rendererState.trailingBreaks === 0
+      ) {
+        insertDirectText(rendererState, "\r");
+      }
+      insertMarkdownTableFallbacks(rendererState);
+      applyInsertedBlockFormats(rendererState);
+      restoreCaretStyle(rendererState);
     },
     cancel() {
       rendererState.cancelled = true;
+      ended = true;
       rendererState.pendingRuns = [];
       rendererState.pendingChars = 0;
       clearFlushTimer(rendererState);

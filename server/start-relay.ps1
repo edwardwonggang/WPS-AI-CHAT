@@ -1,3 +1,7 @@
+param(
+  [switch]$ForceRestart
+)
+
 $ErrorActionPreference = "Stop"
 
 $port = 3888
@@ -6,11 +10,31 @@ $relayScript = Join-Path $PSScriptRoot "relay.mjs"
 $stdoutLog = Join-Path $env:TEMP "wps-ai-relay.stdout.log"
 $stderrLog = Join-Path $env:TEMP "wps-ai-relay.stderr.log"
 
-$existingProcess = Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
-  Where-Object { $_.CommandLine -like "*server\\relay.mjs*" } |
-  Select-Object -First 1
+$existingProcesses = @(Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
+  Where-Object { $_.CommandLine -like "*server\\relay.mjs*" })
 
-if ($existingProcess) {
+if ($ForceRestart) {
+  foreach ($process in $existingProcesses) {
+    try {
+      Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+    } catch {
+      # Ignore stale process records.
+    }
+  }
+
+  $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)
+  foreach ($listener in $listeners) {
+    if ($listener.OwningProcess) {
+      try {
+        Stop-Process -Id $listener.OwningProcess -Force -ErrorAction Stop
+      } catch {
+        # Ignore processes that have already exited.
+      }
+    }
+  }
+
+  Start-Sleep -Milliseconds 500
+} elseif ($existingProcesses.Count -gt 0) {
   exit 0
 }
 

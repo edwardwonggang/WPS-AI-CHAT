@@ -21,7 +21,8 @@ export default defineConfig({
     rollupOptions: {
       input: {
         index: fileURLToPath(new URL("./index.html", import.meta.url)),
-        taskpane: fileURLToPath(new URL("./taskpane.html", import.meta.url))
+        taskpane: fileURLToPath(new URL("./taskpane.html", import.meta.url)),
+        renderSmoke: fileURLToPath(new URL("./render-smoke.html", import.meta.url))
       }
     }
   },
