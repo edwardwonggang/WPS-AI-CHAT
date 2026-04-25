@@ -1105,9 +1105,6 @@ export default function App() {
 
             {settings.providerId === "nvidia" ? (
               <div className="utility-row">
-                <div className="tiny-error">
-                  {"Current mode: local relay. Network access is forwarded through the local 3888 relay."}
-                </div>
                 <button
                   className="secondary-button"
                   type="button"
@@ -1253,7 +1250,7 @@ export default function App() {
       {showModelLab ? (
         <div className="modal-backdrop" onClick={() => setShowModelLab(false)}>
           <section
-            className="modal-card compact wide"
+            className="modal-card compact wide model-lab-card"
             onClick={(event) => event.stopPropagation()}
           >
             <header className="modal-toolbar">

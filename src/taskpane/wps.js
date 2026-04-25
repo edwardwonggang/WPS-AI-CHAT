@@ -35,17 +35,17 @@ import {
 
 const FLUSH_INTERVAL_MS = 12;
 const MAX_PENDING_CHARS = 160;
+const WPS_REFRESH_INTERVAL_MS = 80;
 const ALIGN_LEFT = 0;
 const ALIGN_CENTER = 1;
-const ALIGN_JUSTIFY = 3;
 const LINE_SPACING_EXACTLY = 4;
 const HEADING_SIZES = {
-  [HEADING_1]: 18,
-  [HEADING_2]: 16,
-  [HEADING_3]: 15,
-  [HEADING_4]: 14,
-  [HEADING_5]: 13,
-  [HEADING_6]: 13
+  [HEADING_1]: 16,
+  [HEADING_2]: 15,
+  [HEADING_3]: 14,
+  [HEADING_4]: 12,
+  [HEADING_5]: 12,
+  [HEADING_6]: 12
 };
 const HEADING_LEVELS = {
   [HEADING_1]: 1,
@@ -56,23 +56,30 @@ const HEADING_LEVELS = {
   [HEADING_6]: 6
 };
 const HEADING_SIZE_BY_LEVEL = {
-  1: 18,
-  2: 16,
-  3: 15,
-  4: 14,
-  5: 13,
-  6: 13
+  1: 16,
+  2: 15,
+  3: 14,
+  4: 12,
+  5: 12,
+  6: 12
 };
 const PAPER_BODY_STYLE = Object.freeze({
   name: "SimSun",
   nameAscii: "Times New Roman",
   size: 12
 });
-const PAPER_BODY_LINE_SPACING = 28;
-const PAPER_HEADING_LINE_SPACING = 24;
+const PAPER_TABLE_STYLE = Object.freeze({
+  name: "SimSun",
+  nameAscii: "Times New Roman",
+  size: 10.5
+});
+const PAPER_BODY_LINE_SPACING = 20;
+const PAPER_HEADING_LINE_SPACING = 22;
+const PAPER_TABLE_LINE_SPACING = 18;
 const PAPER_CODE_LINE_SPACING = 18;
-const PAPER_EQUATION_LINE_SPACING = 21;
+const PAPER_EQUATION_LINE_SPACING = 20;
 const PAPER_PARAGRAPH_INDENT_CHARS = 2;
+const HORIZONTAL_RULE_TEXT = "----------------";
 const RAW_BREAK_PLACEHOLDER = "WPS-BR-PLACEHOLDER-ZXCV";
 const RAW_CHECKED_PLACEHOLDER = "WPSCHECKEDBOXPLACEHOLDERZXCV";
 const RAW_UNCHECKED_PLACEHOLDER = "WPSUNCHECKEDBOXPLACEHOLDERZXCV";
@@ -121,6 +128,66 @@ function getApplication() {
 
 function getSelectionRange(app) {
   return app.Selection?.Range || app.ActiveDocument?.ActiveWindow?.Selection?.Range || null;
+}
+
+function clearRefreshTimer(state) {
+  if (state.refreshTimer === null) {
+    return;
+  }
+
+  window.clearTimeout(state.refreshTimer);
+  state.refreshTimer = null;
+}
+
+function forceWpsViewportRefresh(state) {
+  if (state.cancelled || state.disabled || !state.startedWriting) {
+    clearRefreshTimer(state);
+    return;
+  }
+
+  clearRefreshTimer(state);
+  state.lastRefreshAt = Date.now();
+
+  const app = getApplication();
+  const caretPosition = state.anchor + state.position;
+
+  try {
+    app?.Selection?.SetRange(caretPosition, caretPosition);
+  } catch {
+    // Some hosts may not expose a mutable selection.
+  }
+
+  try {
+    app?.ScreenRefresh?.();
+  } catch {
+    // WPS/Word-compatible hosts differ; refresh is best-effort only.
+  }
+}
+
+function requestWpsViewportRefresh(state, immediate = false) {
+  if (state.cancelled || state.disabled || !state.startedWriting) {
+    return;
+  }
+
+  if (immediate) {
+    forceWpsViewportRefresh(state);
+    return;
+  }
+
+  const elapsed = Date.now() - state.lastRefreshAt;
+  if (elapsed >= WPS_REFRESH_INTERVAL_MS) {
+    forceWpsViewportRefresh(state);
+    return;
+  }
+
+  if (state.refreshTimer !== null) {
+    return;
+  }
+
+  state.refreshTimer = window.setTimeout(() => {
+    state.refreshTimer = null;
+    forceWpsViewportRefresh(state);
+  }, WPS_REFRESH_INTERVAL_MS - elapsed);
 }
 
 function sameStyle(left, right) {
@@ -350,6 +417,25 @@ function finishBlock(state, context) {
   });
 }
 
+function createHeadingMarker(state, level) {
+  const normalizedLevel = Math.max(1, Math.min(6, Number(level) || 1));
+
+  for (let index = 0; index < normalizedLevel - 1; index += 1) {
+    if (!state.headingCounters[index]) {
+      state.headingCounters[index] = 1;
+    }
+  }
+
+  state.headingCounters[normalizedLevel - 1] =
+    (state.headingCounters[normalizedLevel - 1] || 0) + 1;
+
+  for (let index = normalizedLevel; index < state.headingCounters.length; index += 1) {
+    state.headingCounters[index] = 0;
+  }
+
+  return `${state.headingCounters.slice(0, normalizedLevel).join(".")} `;
+}
+
 function applyHeadingFormat(range, level) {
   const font = range.Font;
   setFontFamily(font, "SimHei", "Times New Roman");
@@ -360,13 +446,13 @@ function applyHeadingFormat(range, level) {
   }
 
   forEachParagraph(range, (_paragraphRange, paragraph) => {
-    setParagraphNumeric(paragraph, "Alignment", level === 1 ? ALIGN_CENTER : ALIGN_LEFT);
+    setParagraphNumeric(paragraph, "Alignment", ALIGN_LEFT);
     setParagraphNumeric(paragraph, "CharacterUnitFirstLineIndent", 0);
     setParagraphNumeric(paragraph, "CharacterUnitLeftIndent", 0);
     setParagraphNumeric(paragraph, "LineSpacingRule", LINE_SPACING_EXACTLY);
     setParagraphNumeric(paragraph, "LineSpacing", PAPER_HEADING_LINE_SPACING);
-    setParagraphNumeric(paragraph, "SpaceBefore", level === 1 ? 12 : 6);
-    setParagraphNumeric(paragraph, "SpaceAfter", level === 1 ? 12 : 6);
+    setParagraphNumeric(paragraph, "SpaceBefore", level === 1 ? 10 : 6);
+    setParagraphNumeric(paragraph, "SpaceAfter", level === 1 ? 6 : 3);
   });
 }
 
@@ -392,6 +478,69 @@ function applyParagraphFormat(range, kind, depth = 0) {
     setParagraphNumeric(paragraph, "SpaceBefore", 0);
     setParagraphNumeric(paragraph, "SpaceAfter", kind === "table" ? 3 : 0);
   });
+}
+
+function applyTableCellFormat(range, { header = false } = {}) {
+  const font = range.Font;
+  setFontFamily(font, PAPER_TABLE_STYLE.name, PAPER_TABLE_STYLE.nameAscii);
+  font.Size = PAPER_TABLE_STYLE.size;
+  font.Bold = header ? 1 : 0;
+  font.Italic = 0;
+
+  try {
+    font.StrikeThrough = 0;
+  } catch {
+    // Some hosts may not expose StrikeThrough.
+  }
+
+  try {
+    range.Underline = 0;
+  } catch {
+    // Some hosts may not expose Underline on range.
+  }
+
+  forEachParagraph(range, (_paragraphRange, paragraph) => {
+    setParagraphNumeric(paragraph, "Alignment", ALIGN_CENTER);
+    setParagraphNumeric(paragraph, "CharacterUnitLeftIndent", 0);
+    setParagraphNumeric(paragraph, "CharacterUnitFirstLineIndent", 0);
+    setParagraphNumeric(paragraph, "LineSpacingRule", LINE_SPACING_EXACTLY);
+    setParagraphNumeric(paragraph, "LineSpacing", PAPER_TABLE_LINE_SPACING);
+    setParagraphNumeric(paragraph, "SpaceBefore", 0);
+    setParagraphNumeric(paragraph, "SpaceAfter", 0);
+  });
+}
+
+function applyTableFormat(table) {
+  try {
+    table.Borders.Enable = 1;
+  } catch {
+    // Some hosts may not expose Borders.Enable.
+  }
+
+  try {
+    table.Rows.Alignment = ALIGN_CENTER;
+  } catch {
+    // Some hosts may not expose row alignment.
+  }
+
+  try {
+    table.Range.ParagraphFormat.Alignment = ALIGN_CENTER;
+  } catch {
+    // Some hosts may not expose paragraph formatting on table ranges.
+  }
+
+  try {
+    table.PreferredWidthType = 2;
+    table.PreferredWidth = 100;
+  } catch {
+    // Some hosts may not expose preferred table width.
+  }
+
+  try {
+    table.AutoFitBehavior(2);
+  } catch {
+    // Some hosts may not expose AutoFitBehavior.
+  }
 }
 
 function applyCodeFormat(range) {
@@ -430,7 +579,7 @@ function applyBaseParagraphFormat(range) {
   forEachParagraph(range, (_paragraphRange, paragraph) => {
     setParagraphNumeric(paragraph, "Alignment", ALIGN_LEFT);
     setParagraphNumeric(paragraph, "CharacterUnitLeftIndent", 0);
-    setParagraphNumeric(paragraph, "CharacterUnitFirstLineIndent", 0);
+    setParagraphNumeric(paragraph, "CharacterUnitFirstLineIndent", PAPER_PARAGRAPH_INDENT_CHARS);
     setParagraphNumeric(paragraph, "LineSpacingRule", LINE_SPACING_EXACTLY);
     setParagraphNumeric(paragraph, "LineSpacing", PAPER_BODY_LINE_SPACING);
     setParagraphNumeric(paragraph, "SpaceBefore", 0);
@@ -527,11 +676,7 @@ function insertWpsTable(state, tableContext) {
       );
     }
 
-    try {
-      table.Borders.Enable = 1;
-    } catch {
-      // Some hosts may not expose Borders.Enable.
-    }
+    applyTableFormat(table);
 
     for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
       const row = rows[rowIndex] || [];
@@ -541,18 +686,14 @@ function insertWpsTable(state, tableContext) {
         const cellText = normalizeTableCellText(row[columnIndex] ?? "");
 
         cellRange.Text = cellText;
-        applyBaseStyle(cellRange, state.writeStyle);
-        applyBaseParagraphFormat(cellRange);
-
-        if (rowIndex === 0) {
-          cellRange.Font.Bold = 1;
-        }
+        applyTableCellFormat(cellRange, { header: rowIndex === 0 });
       }
     }
 
     state.position = Math.max(state.position, Number(table.Range.End) - state.anchor);
     state.lineStart = true;
     state.trailingBreaks = 1;
+    state.createdTableCount += 1;
   } catch (error) {
     state.debugError = `table:final:${error?.message || error}`;
     state.lineStart = true;
@@ -643,7 +784,7 @@ function normalizeNewlines(text) {
     .replace(/<input[^>]*type=["']checkbox["'][^>]*>/gi, "☐ ")
     .replace(/<\/(td|th)>/gi, "\t")
     .replace(/<\/tr>/gi, "\n")
-    .replace(/<hr\s*\/?>/gi, "\n────────────────\n")
+    .replace(/<hr\s*\/?>/gi, `\n${HORIZONTAL_RULE_TEXT}\n`)
     .replace(/<(strong|b)>/gi, "")
     .replace(/<\/(strong|b)>/gi, "")
     .replace(/<(em|i)>/gi, "")
@@ -680,6 +821,13 @@ function normalizeMarkdownInput(text) {
 
 function normalizeTableCellText(text) {
   return normalizeNewlines(text)
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/(\*\*|__)(.*?)\1/g, "$2")
+    .replace(/(^|[^\*])\*([^*\n]+)\*(?!\*)/g, "$1$2")
+    .replace(/(^|[^_])_([^_\n]+)_(?!_)/g, "$1$2")
+    .replace(/~~(.*?)~~/g, "$1")
     .replace(/\s*\|\s*$/, "")
     .replace(/[ \t]+\n/g, "\n")
     .trim();
@@ -757,6 +905,10 @@ function extractMarkdownTables(text) {
 }
 
 function insertMarkdownTableFallbacks(state) {
+  if (state.createdTableCount > 0) {
+    return;
+  }
+
   const currentCount = Number(state.doc?.Tables?.Count ?? 0);
   if (currentCount > state.initialTableCount) {
     return;
@@ -888,6 +1040,7 @@ function insertDirectText(state, text, style = null) {
 
   state.position += normalized.length;
   updateLineState(state, normalized);
+  requestWpsViewportRefresh(state);
 }
 
 function ensureLeadingBreak(state) {
@@ -984,6 +1137,7 @@ function flushPending(state) {
     state.position += batchText.length;
     applyBaseRangeFormat(state, batchStart, batchEnd);
     applyPendingBlockFormats(state);
+    requestWpsViewportRefresh(state);
   } catch {
     state.disabled = true;
   }
@@ -1115,6 +1269,7 @@ function consumeLinePrefix(state) {
   const quoteDepth = state.stack.filter((entry) => entry.type === BLOCKQUOTE).length;
   const listItemDepth = state.stack.filter((entry) => entry.type === LIST_ITEM).length;
   const listItem = findLastContext(state, (entry) => entry.type === LIST_ITEM);
+  const heading = findLastContext(state, (entry) => Boolean(entry.headingPrefixPending));
 
   let prefix = "";
   if (listItemDepth > 1) {
@@ -1128,6 +1283,11 @@ function consumeLinePrefix(state) {
   if (listItem?.prefixPending) {
     prefix += listItem.marker || "\u2022 ";
     listItem.prefixPending = false;
+  }
+
+  if (heading?.headingPrefixPending) {
+    prefix += heading.headingMarker || "";
+    heading.headingPrefixPending = false;
   }
 
   if (prefix) {
@@ -1235,6 +1395,10 @@ function pushToken(state, type) {
       if ((state.position > 0 || state.pendingChars > 0) && state.trailingBreaks === 0) {
         ensureBreaks(state, 1);
       }
+      if (HEADING_LEVELS[type]) {
+        context.headingMarker = createHeadingMarker(state, HEADING_LEVELS[type]);
+        context.headingPrefixPending = true;
+      }
       break;
     case LIST_ITEM:
       if ((state.position > 0 || state.pendingChars > 0) && state.trailingBreaks === 0) {
@@ -1263,7 +1427,7 @@ function pushToken(state, type) {
 
   if (type === RULE) {
     consumeLinePrefix(state);
-    queueText(state, "────────────────", INLINE_DEFAULTS, true);
+    queueText(state, HORIZONTAL_RULE_TEXT, INLINE_DEFAULTS, true);
     ensureBreaks(state, 1);
   }
 }
@@ -1425,9 +1589,12 @@ export function createWpsMarkdownSink({ replaceSelection } = {}) {
     anchor,
     baseStyle,
     cancelled: false,
+    createdTableCount: 0,
     disabled: false,
     doc,
     flushTimer: null,
+    lastRefreshAt: 0,
+    headingCounters: [0, 0, 0, 0, 0, 0],
     initialTableCount: Number(doc?.Tables?.Count ?? 0),
     lineStart: true,
     blocks: [],
@@ -1438,6 +1605,7 @@ export function createWpsMarkdownSink({ replaceSelection } = {}) {
     replaceSelection: Boolean(replaceSelection),
     rawMarkdown: "",
     rawTextCarry: "",
+    refreshTimer: null,
     debugError: "",
     selectionEnd,
     selectionStart,
@@ -1486,6 +1654,7 @@ export function createWpsMarkdownSink({ replaceSelection } = {}) {
       insertMarkdownTableFallbacks(rendererState);
       applyInsertedBlockFormats(rendererState);
       restoreCaretStyle(rendererState);
+      requestWpsViewportRefresh(rendererState, true);
     },
     cancel() {
       rendererState.cancelled = true;
@@ -1493,6 +1662,7 @@ export function createWpsMarkdownSink({ replaceSelection } = {}) {
       rendererState.pendingRuns = [];
       rendererState.pendingChars = 0;
       clearFlushTimer(rendererState);
+      clearRefreshTimer(rendererState);
 
       if (
         rendererState.replaceSelection &&

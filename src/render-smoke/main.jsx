@@ -10,22 +10,28 @@ const SAMPLES = [
   {
     id: "heading-paragraph",
     label: "Heading and Body",
-    markdown: "# Primary Heading\n\nThis is the first body paragraph used to verify standard paragraph formatting.",
+    markdown:
+      "# Primary Heading\n\n## Secondary Heading\n\n### Third Heading\n\nThis is the first body paragraph used to verify standard paragraph formatting.",
     verifyChat(root) {
       return Boolean(root.querySelector("h1") && root.querySelector("p"));
     },
     verifyWps(output) {
       return (
-        output.stream.includes("Primary Heading") &&
+        output.stream.includes("1 Primary Heading") &&
+        output.stream.includes("1.1 Secondary Heading") &&
+        output.stream.includes("1.1.1 Third Heading") &&
         output.stream.includes("first body paragraph") &&
         output.ranges.some(
           (record) =>
-            record.paragraph.Alignment === 1 &&
+            record.paragraph.Alignment === 0 &&
+            Number(record.font.Size) === 16 &&
             record.font.Name === "SimHei"
         ) &&
         output.ranges.some(
           (record) =>
-            record.paragraph.LineSpacing === 28 &&
+            record.paragraph.Alignment === 0 &&
+            record.paragraph.CharacterUnitFirstLineIndent === 2 &&
+            record.paragraph.LineSpacing === 20 &&
             record.font.Name === "SimSun"
         )
       );
@@ -60,7 +66,7 @@ const SAMPLES = [
     verifyWps(output) {
       return (
         output.stream.includes("This is quoted content") &&
-        output.stream.includes("────────────────") &&
+        output.stream.includes("----------------") &&
         output.ranges.some((record) => record.paragraph.CharacterUnitLeftIndent === 2)
       );
     }
@@ -85,7 +91,7 @@ const SAMPLES = [
     id: "table-break",
     label: "Table and Line Break",
     markdown:
-      "| Person | Role |\n| --- | --- |\n| Gattuso | Patriarch<br>Current: effective leader of the New Secret Party |\n| Vito | Elder |",
+      "| **Person** | `Role` |\n| --- | --- |\n| Gattuso | **Patriarch**<br>Current: effective leader of the New Secret Party |\n| Vito | Elder |",
     verifyChat(root) {
       return Boolean(root.querySelector("td br"));
     },
@@ -94,6 +100,15 @@ const SAMPLES = [
         output.tables.length === 1 &&
         output.tables[0].rows.length === 3 &&
         output.tables[0].rows[0].cells.length === 2 &&
+        output.tables[0].rows[0].cells[0].font.Bold === 1 &&
+        Number(output.tables[0].rows[0].cells[0].font.Size) === 10.5 &&
+        output.tables[0].autoFitBehavior === 2 &&
+        output.tables[0].preferredWidth === 100 &&
+        output.tables[0].rows[0].cells[0].text === "Person" &&
+        output.tables[0].rows[0].cells[1].text === "Role" &&
+        output.tables[0].rows[1].cells[0].paragraph.Alignment === 1 &&
+        output.tables[0].rows[1].cells[1].text.includes("Patriarch") &&
+        !output.tables[0].rows[1].cells[1].text.includes("**") &&
         output.tables[0].rows[1].cells[1].text.includes("\n")
       );
     }
@@ -215,7 +230,11 @@ class FakeDocument {
         Range: null
       }
     };
+    const self = this;
     this.Tables = {
+      get Count() {
+        return self.tables.length;
+      },
       Add: (range, rowCount, columnCount) => this.addTable(range, rowCount, columnCount)
     };
   }
@@ -263,12 +282,30 @@ class FakeDocument {
       }))
     );
     const table = {
+      autoFitBehavior: null,
       Borders: {
         Enable: 0
+      },
+      AutoFitBehavior(value) {
+        this.autoFitBehavior = value;
       },
       Cell: (row, column) => ({
         Range: new FakeCellRange(rows[row - 1][column - 1])
       }),
+      preferredWidth: null,
+      preferredWidthType: null,
+      get PreferredWidth() {
+        return this.preferredWidth;
+      },
+      set PreferredWidth(value) {
+        this.preferredWidth = value;
+      },
+      get PreferredWidthType() {
+        return this.preferredWidthType;
+      },
+      set PreferredWidthType(value) {
+        this.preferredWidthType = value;
+      },
       Range: {
         End: start + 1
       },
@@ -330,6 +367,9 @@ function runWpsSample(markdown) {
     })),
     stream: doc.stream.replaceAll(TABLE_MARKER, "[TABLE]"),
     tables: doc.tables.map((table) => ({
+      autoFitBehavior: table.autoFitBehavior,
+      preferredWidth: table.preferredWidth,
+      preferredWidthType: table.preferredWidthType,
       rows: table.rows.map((row) => ({
         cells: row.map((cell) => ({
           font: { ...cell.format.font },
