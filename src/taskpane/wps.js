@@ -1286,6 +1286,7 @@ function flushPending(state) {
     const batchEnd = batchStart + batchText.length;
     const batchRange = state.doc.Range(batchStart, batchEnd);
     applyBaseStyle(batchRange, state.writeStyle);
+    applyBaseParagraphFormat(batchRange);
 
     let offset = 0;
     for (const run of runs) {
@@ -1301,7 +1302,6 @@ function flushPending(state) {
     }
 
     state.position += batchText.length;
-    applyBaseRangeFormat(state, batchStart, batchEnd);
     applyPendingBlockFormats(state);
     requestWpsViewportRefresh(state);
   } catch {
