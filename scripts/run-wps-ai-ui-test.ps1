@@ -365,43 +365,67 @@ function Get-FormatStats {
     boldChars = 0
     italicChars = 0
     headingLikeParagraphs = 0
+    quoteLikeParagraphs = 0
+    codeLineNumberParagraphs = 0
     leftAlignedParagraphs = 0
     paragraphSamples = @()
   }
 
   try {
-    $paragraphCount = [Math]::Min([int]$Document.Paragraphs.Count, 16)
+    $paragraphCount = [Math]::Min([int]$Document.Paragraphs.Count, 80)
     for ($i = 1; $i -le $paragraphCount; $i++) {
       $paragraph = $Document.Paragraphs.Item($i)
       $range = $paragraph.Range
-      $text = ([string]$range.Text -replace "\s+", " ").Trim()
-      if ($text.Length -gt 80) {
-        $text = $text.Substring(0, 80)
-      }
+      $text = ([string]$range.Text -replace "[\u0000-\u001f]", " " -replace "\s+", " ").Trim()
 
       $fontSize = 0
       $bold = 0
       $alignment = ""
       $lineSpacing = 0
+      $leftIndent = 0
+      $firstLineIndent = 0
+      $fontName = ""
+      $fontNameAscii = ""
       try { $fontSize = [double]$range.Font.Size } catch {}
       try { $bold = [int]$range.Font.Bold } catch {}
       try { $alignment = [string]$range.ParagraphFormat.Alignment } catch {}
       try { $lineSpacing = [double]$range.ParagraphFormat.LineSpacing } catch {}
+      try { $leftIndent = [double]$range.ParagraphFormat.CharacterUnitLeftIndent } catch {}
+      try { $firstLineIndent = [double]$range.ParagraphFormat.CharacterUnitFirstLineIndent } catch {}
+      try { $fontName = [string]$range.Font.Name } catch {}
+      try { $fontNameAscii = [string]$range.Font.NameAscii } catch {}
 
       if ($fontSize -ge 14 -or $bold -ne 0) {
         $stats.headingLikeParagraphs++
+      }
+      if ($leftIndent -ge 2 -and $firstLineIndent -ge 0 -and $fontNameAscii -notlike "*Consolas*") {
+        $stats.quoteLikeParagraphs++
+      }
+      if ($text -match "^\d+\s+\S" -and ($fontName -like "*Consolas*" -or $fontNameAscii -like "*Consolas*")) {
+        $stats.codeLineNumberParagraphs++
       }
       if ($alignment -eq "0" -or $alignment -eq "wdAlignParagraphLeft") {
         $stats.leftAlignedParagraphs++
       }
 
-      $stats.paragraphSamples += [pscustomobject]@{
-        index = $i
-        text = $text
-        fontSize = $fontSize
-        bold = $bold
-        alignment = $alignment
-        lineSpacing = $lineSpacing
+      if ($stats.paragraphSamples.Count -lt 24) {
+        $sampleText = $text
+        if ($sampleText.Length -gt 80) {
+          $sampleText = $sampleText.Substring(0, 80)
+        }
+
+        $stats.paragraphSamples += [pscustomobject]@{
+          index = $i
+          text = $sampleText
+          fontName = $fontName
+          fontNameAscii = $fontNameAscii
+          fontSize = $fontSize
+          bold = $bold
+          alignment = $alignment
+          lineSpacing = $lineSpacing
+          leftIndent = $leftIndent
+          firstLineIndent = $firstLineIndent
+        }
       }
     }
   } catch {}
@@ -664,9 +688,11 @@ $summary = [pscustomobject]@{
   checks = [pscustomobject]@{
     bodyText = ($finalText.Length -gt 200)
     headings = ($formatStats.headingLikeParagraphs -ge 2)
+    quote = ($formatStats.quoteLikeParagraphs -ge 1)
     table = $tableOk
     codeFont = ($formatStats.codeFontChars -gt 0)
     codeColor = ($formatStats.coloredChars -gt 0)
+    codeLineNumbers = ($formatStats.codeLineNumberParagraphs -ge 2)
     bold = ($formatStats.boldChars -gt 0)
     italic = ($formatStats.italicChars -gt 0)
   }
@@ -692,6 +718,8 @@ Add-Log ("FINAL_TABLES={0}" -f $summary.tableCount)
 Add-Log ("CODE_FONT_CHARS={0}" -f $formatStats.codeFontChars)
 Add-Log ("COLORED_CHARS={0}" -f $formatStats.coloredChars)
 Add-Log ("HEADING_LIKE_PARAGRAPHS={0}" -f $formatStats.headingLikeParagraphs)
+Add-Log ("QUOTE_LIKE_PARAGRAPHS={0}" -f $formatStats.quoteLikeParagraphs)
+Add-Log ("CODE_LINE_NUMBER_PARAGRAPHS={0}" -f $formatStats.codeLineNumberParagraphs)
 
 $failedChecks = @()
 foreach ($property in $summary.checks.PSObject.Properties) {
