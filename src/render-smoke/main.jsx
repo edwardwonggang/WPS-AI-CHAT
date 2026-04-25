@@ -6,6 +6,30 @@ import { createWpsMarkdownSink } from "../taskpane/wps";
 
 const TABLE_MARKER = "\uFFF0";
 
+function hasEffectiveTextStyle(output, text, predicate) {
+  const start = output.stream.indexOf(text);
+  if (start < 0) {
+    return false;
+  }
+
+  const end = start + text.length;
+  const fonts = Array.from({ length: text.length }, () => ({}));
+
+  for (const record of output.ranges) {
+    const from = Math.max(start, record.start);
+    const to = Math.min(end, record.end);
+    if (to <= from) {
+      continue;
+    }
+
+    for (let index = from; index < to; index += 1) {
+      Object.assign(fonts[index - start], record.font);
+    }
+  }
+
+  return fonts.length > 0 && fonts.every(predicate);
+}
+
 const SAMPLES = [
   {
     id: "heading-paragraph",
@@ -21,8 +45,8 @@ const SAMPLES = [
         output.stream.includes("1.1 Secondary Heading") &&
         output.stream.includes("1.1.1 Third Heading") &&
         output.stream.includes("first body paragraph") &&
-        output.ranges.some((record) => record.font.Bold === 1) &&
-        output.ranges.some((record) => record.font.Italic === 1) &&
+        hasEffectiveTextStyle(output, "bold text", (font) => font.Bold === 1) &&
+        hasEffectiveTextStyle(output, "italic text", (font) => font.Italic === 1) &&
         output.ranges.some(
           (record) =>
             record.paragraph.Alignment === 0 &&
