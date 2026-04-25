@@ -357,6 +357,68 @@ summary:focus-visible {
   line-height: 1.65;
 }
 
+.chat-code-block {
+  margin: 0 0 0.9em;
+  overflow: hidden;
+  border: 1px solid rgba(17, 17, 17, 0.08);
+  border-radius: 8px;
+  background: #f6f8fb;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+}
+
+.chat-code-toolbar {
+  min-height: 34px;
+  padding: 0 10px 0 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid rgba(17, 17, 17, 0.07);
+  color: rgba(29, 29, 31, 0.58);
+  font-size: 12px;
+}
+
+.chat-code-toolbar button {
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid rgba(0, 113, 227, 0.12);
+  border-radius: 999px;
+  color: var(--accent-strong);
+  background: rgba(255, 255, 255, 0.72);
+  cursor: pointer;
+}
+
+.chat-code-content {
+  margin: 0;
+  padding: 13px 14px;
+  overflow-x: auto;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.bubble-markdown .chat-code-content {
+  margin: 0;
+  padding: 13px 14px;
+  overflow-x: auto;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.chat-code-content code,
+.bubble-markdown .chat-code-content code {
+  display: block;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.65;
+}
+
 .bubble-markdown hr {
   height: 1px;
   border: 0;

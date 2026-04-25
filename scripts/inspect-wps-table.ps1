@@ -1,7 +1,34 @@
+param(
+  [string]$DocumentName = ""
+)
+
 $ErrorActionPreference = "Stop"
 
-$app = New-Object -ComObject kwps.Application
-$doc = $app.ActiveDocument
+try {
+  $app = [System.Runtime.InteropServices.Marshal]::GetActiveObject("kwps.Application")
+} catch {
+  $app = New-Object -ComObject kwps.Application
+}
+
+$doc = $null
+
+if (-not [string]::IsNullOrWhiteSpace($DocumentName)) {
+  for ($i = 1; $i -le $app.Documents.Count; $i++) {
+    $candidate = $app.Documents.Item($i)
+    if ([string]$candidate.Name -like "*$DocumentName*") {
+      $doc = $candidate
+      break
+    }
+  }
+}
+
+if (-not $doc) {
+  $doc = $app.ActiveDocument
+}
+
+if (-not $doc) {
+  throw "No active WPS Writer document."
+}
 
 Write-Output ("DOCNAME=" + $doc.Name)
 

@@ -32,6 +32,7 @@ import {
   parser_end,
   parser_write
 } from "streaming-markdown";
+import hljs, { normalizeCodeLanguage } from "./codeHighlighter";
 
 const FLUSH_INTERVAL_MS = 12;
 const MAX_PENDING_CHARS = 160;
@@ -79,6 +80,10 @@ const PAPER_TABLE_LINE_SPACING = 18;
 const PAPER_CODE_LINE_SPACING = 18;
 const PAPER_EQUATION_LINE_SPACING = 20;
 const PAPER_PARAGRAPH_INDENT_CHARS = 2;
+const CODE_LINE_NUMBER_SEPARATOR = "   ";
+const CODE_LINE_NUMBER_MIN_WIDTH = 2;
+const CODE_LINE_NUMBER_COLOR = "#8c959f";
+const CODE_BLOCK_BORDER_COLOR = "#ff3040";
 const HORIZONTAL_RULE_TEXT = "----------------";
 const RAW_BREAK_PLACEHOLDER = "WPS-BR-PLACEHOLDER-ZXCV";
 const RAW_CHECKED_PLACEHOLDER = "WPSCHECKEDBOXPLACEHOLDERZXCV";
@@ -104,10 +109,32 @@ const RAW_TOKEN_MARKERS = [
 const INLINE_DEFAULTS = Object.freeze({
   bold: false,
   code: false,
+  color: null,
   italic: false,
   size: null,
   strike: false,
   underline: false
+});
+const CODE_TOKEN_COLORS = Object.freeze({
+  attr: "#953800",
+  attribute: "#953800",
+  built_in: "#953800",
+  bullet: "#735c0f",
+  comment: "#6a737d",
+  doctag: "#d73a49",
+  keyword: "#d73a49",
+  literal: "#005cc5",
+  meta: "#6a737d",
+  number: "#005cc5",
+  operator: "#d73a49",
+  regexp: "#032f62",
+  section: "#005cc5",
+  string: "#032f62",
+  subst: "#24292e",
+  symbol: "#953800",
+  title: "#6f42c1",
+  type: "#d73a49",
+  variable: "#e36209"
 });
 
 function getApplication() {
@@ -194,6 +221,7 @@ function sameStyle(left, right) {
   return (
     left.bold === right.bold &&
     left.code === right.code &&
+    left.color === right.color &&
     left.italic === right.italic &&
     left.size === right.size &&
     left.strike === right.strike &&
@@ -203,6 +231,90 @@ function sameStyle(left, right) {
 
 function isDefaultStyle(style) {
   return sameStyle(style, INLINE_DEFAULTS);
+}
+
+function cssColorToWpsColor(color) {
+  const match = String(color || "").trim().match(/^#?([0-9a-f]{6})$/i);
+  if (!match) {
+    return null;
+  }
+
+  const value = match[1];
+  const red = Number.parseInt(value.slice(0, 2), 16);
+  const green = Number.parseInt(value.slice(2, 4), 16);
+  const blue = Number.parseInt(value.slice(4, 6), 16);
+  return red + green * 256 + blue * 65536;
+}
+
+function codeTokenColor(className, inheritedColor = null) {
+  const classes = String(className || "").split(/\s+/);
+  for (const item of classes) {
+    const token = item.replace(/^hljs-/, "");
+    const color = CODE_TOKEN_COLORS[token];
+    if (color) {
+      return cssColorToWpsColor(color);
+    }
+  }
+
+  return inheritedColor;
+}
+
+function collectHighlightedRuns(node, runs, inheritedColor = null) {
+  if (!node) {
+    return;
+  }
+
+  if (node.nodeType === 3) {
+    const text = node.nodeValue || "";
+    if (text) {
+      runs.push({ color: inheritedColor, text });
+    }
+    return;
+  }
+
+  const nextColor =
+    node.nodeType === 1 ? codeTokenColor(node.getAttribute("class"), inheritedColor) : inheritedColor;
+
+  for (const child of Array.from(node.childNodes || [])) {
+    collectHighlightedRuns(child, runs, nextColor);
+  }
+}
+
+function createHighlightedCodeRuns(text, language) {
+  const source = String(text ?? "");
+  if (!source) {
+    return [];
+  }
+
+  if (typeof document === "undefined") {
+    return [{ color: null, text: source }];
+  }
+
+  try {
+    const normalizedLanguage = normalizeCodeLanguage(language);
+    const result =
+      normalizedLanguage && hljs.getLanguage(normalizedLanguage)
+        ? hljs.highlight(source, {
+            ignoreIllegals: true,
+            language: normalizedLanguage
+          })
+        : hljs.highlightAuto(source);
+
+    const root = document.createElement("div");
+    root.innerHTML = result.value;
+    const runs = [];
+    collectHighlightedRuns(root, runs);
+    return runs.length > 0 ? runs : [{ color: null, text: source }];
+  } catch {
+    return [{ color: null, text: source }];
+  }
+}
+
+function activeCodeBlockContext(state) {
+  return findLastContext(
+    state,
+    (entry) => entry.type === CODE_BLOCK || entry.type === CODE_FENCE
+  );
 }
 
 function applyTextStyle(range, style) {
@@ -218,6 +330,14 @@ function applyTextStyle(range, style) {
   if (style.code) {
     font.Name = "Consolas";
     font.NameAscii = "Consolas";
+  }
+
+  if (style.color !== null && style.color !== undefined) {
+    try {
+      font.Color = style.color;
+    } catch {
+      // Some hosts may not expose font color.
+    }
   }
 
   try {
@@ -557,6 +677,44 @@ function applyCodeFormat(range) {
     setParagraphNumeric(paragraph, "SpaceBefore", 6);
     setParagraphNumeric(paragraph, "SpaceAfter", 6);
   });
+
+  applyCodeBlockBorder(range);
+}
+
+function applyCodeBlockBorder(range) {
+  const borderColor = cssColorToWpsColor(CODE_BLOCK_BORDER_COLOR);
+
+  try {
+    range.Borders.Enable = 1;
+  } catch {
+    // Some hosts may not expose paragraph borders.
+  }
+
+  try {
+    range.Borders.OutsideLineStyle = 1;
+    range.Borders.OutsideColor = borderColor;
+  } catch {
+    // Some hosts may not expose outside border shortcuts.
+  }
+
+  for (const borderIndex of [-1, -2, -3, -4, 1, 2, 3, 4]) {
+    try {
+      const border = range.Borders.Item(borderIndex);
+      border.LineStyle = 1;
+      border.LineWidth = 4;
+      border.Color = borderColor;
+    } catch {
+      // WPS and Word expose different border index constants.
+    }
+  }
+
+  for (const borderIndex of [-5, -6, 5, 6]) {
+    try {
+      range.Borders.Item(borderIndex).LineStyle = 0;
+    } catch {
+      // Internal borders are optional for paragraph groups.
+    }
+  }
 }
 
 function applyEquationFormat(range) {
@@ -1295,6 +1453,78 @@ function consumeLinePrefix(state) {
   }
 }
 
+function queueCodeLineNumber(state, codeBlock) {
+  if (!codeBlock) {
+    return;
+  }
+
+  if (!Number.isFinite(codeBlock.codeLineNumber)) {
+    codeBlock.codeLineNumber = 1;
+  }
+
+  const label = String(codeBlock.codeLineNumber).padStart(CODE_LINE_NUMBER_MIN_WIDTH, " ");
+  codeBlock.codeLineNumber += 1;
+  codeBlock.codeLineStart = false;
+
+  queueText(state, `${label}${CODE_LINE_NUMBER_SEPARATOR}`, {
+    ...INLINE_DEFAULTS,
+    code: true,
+    color: cssColorToWpsColor(CODE_LINE_NUMBER_COLOR)
+  });
+}
+
+function queueHighlightedCodeRun(state, codeBlock, text, color) {
+  const source = normalizeNewlines(text);
+  if (!source) {
+    return;
+  }
+
+  let remaining = source;
+  while (remaining.length > 0) {
+    if (codeBlock?.codeLineStart) {
+      queueCodeLineNumber(state, codeBlock);
+    }
+
+    const newlineIndex = remaining.indexOf("\n");
+    const segment = newlineIndex >= 0 ? remaining.slice(0, newlineIndex) : remaining;
+
+    if (segment) {
+      queueText(state, segment, {
+        ...INLINE_DEFAULTS,
+        code: true,
+        color
+      });
+    }
+
+    if (newlineIndex < 0) {
+      break;
+    }
+
+    queueText(state, "\r", INLINE_DEFAULTS, true);
+    if (codeBlock) {
+      codeBlock.codeLineStart = true;
+    }
+    remaining = remaining.slice(newlineIndex + 1);
+  }
+}
+
+function appendHighlightedCodeText(state, text, language, codeBlock = null) {
+  if (codeBlock && !Number.isFinite(codeBlock.codeLineNumber)) {
+    codeBlock.codeLineNumber = 1;
+    codeBlock.codeLineStart = true;
+  }
+
+  const runs = createHighlightedCodeRuns(text, language);
+
+  for (const run of runs) {
+    if (!run.text) {
+      continue;
+    }
+
+    queueHighlightedCodeRun(state, codeBlock, run.text, run.color);
+  }
+}
+
 function appendText(state, text) {
   const combined = `${state.rawTextCarry || ""}${String(text ?? "")}`;
   const { carry, safeText } = splitPlaceholderCarry(combined);
@@ -1325,6 +1555,12 @@ function appendText(state, text) {
     if (tail) {
       appendText(state, tail);
     }
+    return;
+  }
+
+  const codeBlock = activeCodeBlockContext(state);
+  if (codeBlock) {
+    appendHighlightedCodeText(state, normalized, codeBlock.attrs?.get(Attr.Lang), codeBlock);
     return;
   }
 

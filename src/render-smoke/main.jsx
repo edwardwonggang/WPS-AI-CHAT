@@ -82,7 +82,9 @@ const SAMPLES = [
     verifyWps(output) {
       return (
         output.stream.includes("E=mc^2") &&
+        output.stream.includes(" 1   const x = 1;") &&
         output.ranges.some((record) => record.font.Name === "Consolas") &&
+        output.ranges.some((record) => Number.isFinite(record.font.Color)) &&
         output.ranges.some((record) => record.paragraph.Alignment === 1)
       );
     }

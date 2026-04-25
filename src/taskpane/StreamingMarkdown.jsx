@@ -1,6 +1,6 @@
-import { Children, isValidElement } from "react";
+import { Children, isValidElement, useMemo, useState } from "react";
+import hljs, { normalizeCodeLanguage } from "./codeHighlighter";
 import ReactMarkdown from "react-markdown";
-import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
 import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
@@ -24,6 +24,62 @@ function flattenText(node) {
   return "";
 }
 
+function normalizeLanguage(className = "") {
+  const match = String(className).match(/\blanguage-([\w-]+)/);
+  return normalizeCodeLanguage(match?.[1]);
+}
+
+function highlightCode(code, language) {
+  try {
+    if (language && language !== "text" && hljs.getLanguage(language)) {
+      return hljs.highlight(code, {
+        ignoreIllegals: true,
+        language
+      }).value;
+    }
+
+    return hljs.highlightAuto(code).value;
+  } catch {
+    return hljs.highlight(code, {
+      ignoreIllegals: true,
+      language: "plaintext"
+    }).value;
+  }
+}
+
+function CodeBlock({ className, code }) {
+  const language = useMemo(() => normalizeLanguage(className), [className]);
+  const html = useMemo(() => highlightCode(code, language), [code, language]);
+  const [copied, setCopied] = useState(false);
+
+  async function copyCode() {
+    try {
+      await navigator.clipboard?.writeText(code);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  return (
+    <div className="chat-code-block">
+      <div className="chat-code-toolbar">
+        <span>{language}</span>
+        <button type="button" onClick={copyCode}>
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      <pre className="chat-code-content">
+        <code
+          className={`hljs language-${language}`}
+          dangerouslySetInnerHTML={{ __html: html }}
+        />
+      </pre>
+    </div>
+  );
+}
+
 export default function StreamingMarkdown({ content, streaming }) {
   const markdown = String(content ?? "");
 
@@ -35,10 +91,23 @@ export default function StreamingMarkdown({ content, streaming }) {
     <div className="bubble-markdown">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[rehypeRaw, rehypeKatex, rehypeHighlight]}
+        rehypePlugins={[rehypeRaw, rehypeKatex]}
         components={{
           a(props) {
             return <a {...props} target="_blank" rel="noreferrer" />;
+          },
+          pre({ children }) {
+            const child = Children.toArray(children).find(isValidElement);
+            if (child?.props?.["data-code-block"]) {
+              return (
+                <CodeBlock
+                  className={child.props.className || ""}
+                  code={child.props["data-code-value"] || ""}
+                />
+              );
+            }
+
+            return <pre>{children}</pre>;
           },
           code({ className, children, node, ...props }) {
             const value = flattenText(Children.toArray(children));
@@ -46,7 +115,12 @@ export default function StreamingMarkdown({ content, streaming }) {
 
             if (isBlock) {
               return (
-                <code className={className} {...props}>
+                <code
+                  className={className}
+                  data-code-block="true"
+                  data-code-value={value.replace(/\n$/, "")}
+                  {...props}
+                >
                   {value.replace(/\n$/, "")}
                 </code>
               );

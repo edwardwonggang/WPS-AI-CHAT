@@ -79,6 +79,46 @@ function mergeBootstrapSettings(current, bootstrap) {
   });
 }
 
+const TEST_COMMAND_BASE_URL = "http://127.0.0.1:3888/test-command";
+const TEST_AUTOMATION_POLL_MS = 900;
+
+function normalizeVisibleDelayMs(value) {
+  return Math.min(8000, Math.max(600, Number(value) || 1800));
+}
+
+async function postTestCommandJson(path, payload) {
+  const response = await fetch(`${TEST_COMMAND_BASE_URL}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    return null;
+  }
+
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+function acknowledgeTestCommand(id, stage, document, detail = {}) {
+  if (!id) {
+    return;
+  }
+
+  void postTestCommandJson("/ack", {
+    id,
+    stage,
+    document,
+    detail
+  });
+}
+
 function modelEntryTitle(entry) {
   const lines = [entry.id, entry.ownedBy || "nvidia", benchmarkLabel(entry)];
 
@@ -189,6 +229,7 @@ export default function App() {
   const liveSinkRef = useRef(null);
   const activeDocumentRef = useRef(readDocumentInfo());
   const isGeneratingRef = useRef(false);
+  const handleGenerateRef = useRef(null);
   const latestMessagesRef = useRef([]);
   const messageBufferRef = useRef({
     chunk: "",
@@ -724,8 +765,8 @@ export default function App() {
     setModelSearch("");
   }
 
-  async function handleGenerate() {
-    const trimmedPrompt = prompt.trim();
+  async function handleGenerate(promptOverride = prompt) {
+    const trimmedPrompt = String(promptOverride ?? "").trim();
     if (!settings.apiKey.trim()) {
       setError("Enter the API key first.");
       openSettings();
@@ -864,6 +905,87 @@ export default function App() {
       }
     }
   }
+
+  useEffect(() => {
+    handleGenerateRef.current = handleGenerate;
+  });
+
+  useEffect(() => {
+    let stopped = false;
+    let pollTimerId = null;
+    let submitTimerId = null;
+
+    function schedulePoll(delay = TEST_AUTOMATION_POLL_MS) {
+      if (stopped) {
+        return;
+      }
+
+      pollTimerId = window.setTimeout(() => {
+        void pollTestCommand();
+      }, delay);
+    }
+
+    async function pollTestCommand() {
+      if (stopped) {
+        return;
+      }
+
+      try {
+        const document = readDocumentInfo();
+        const data = await postTestCommandJson("/poll", {
+          document
+        });
+        const command = data?.command;
+
+        if (command?.id && typeof command.prompt === "string") {
+          const nextPrompt = command.prompt;
+          const visibleDelayMs = normalizeVisibleDelayMs(command.visibleDelayMs);
+
+          setPrompt(nextPrompt);
+          shouldStickToBottomRef.current = true;
+
+          window.requestAnimationFrame(() => {
+            if (stopped) {
+              return;
+            }
+
+            promptRef.current?.focus();
+            acknowledgeTestCommand(command.id, "filled", readDocumentInfo(), {
+              promptLength: nextPrompt.length,
+              visibleDelayMs
+            });
+
+            submitTimerId = window.setTimeout(() => {
+              if (stopped) {
+                return;
+              }
+
+              acknowledgeTestCommand(command.id, "submitted", readDocumentInfo(), {
+                promptLength: nextPrompt.length
+              });
+              void handleGenerateRef.current?.(nextPrompt);
+            }, visibleDelayMs);
+          });
+        }
+      } catch {
+        // Browser preview and first-run WPS sessions may not have the relay yet.
+      } finally {
+        schedulePoll();
+      }
+    }
+
+    schedulePoll(700);
+
+    return () => {
+      stopped = true;
+      if (pollTimerId !== null) {
+        window.clearTimeout(pollTimerId);
+      }
+      if (submitTimerId !== null) {
+        window.clearTimeout(submitTimerId);
+      }
+    };
+  }, []);
 
   function clearConversation() {
     if (isGenerating) {

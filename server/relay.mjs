@@ -374,6 +374,9 @@ const PROXY_ENV = resolveProxyEnv(RELAY_CONFIG);
 const DIRECT_ENV = createDirectEnv(process.env);
 const BOOTSTRAP_SETTINGS = normalizeBootstrapSettings(RELAY_CONFIG);
 const SESSION_ROOT = normalizeSessionRoot(RELAY_CONFIG);
+let pendingTestCommand = null;
+let testCommandSeq = 0;
+const testCommandStatuses = new Map();
 
 function setCorsHeaders(res, req = null) {
   const origin = req?.headers?.origin;
@@ -439,6 +442,207 @@ async function readFormBody(req) {
 
   const params = new URLSearchParams(raw);
   return Object.fromEntries(params.entries());
+}
+
+function normalizeTestDocument(document) {
+  if (!document || typeof document !== "object") {
+    return null;
+  }
+
+  return {
+    key: String(document.key ?? ""),
+    title: String(document.title ?? document.name ?? ""),
+    name: String(document.name ?? document.title ?? ""),
+    fullName: String(document.fullName ?? "")
+  };
+}
+
+function rememberTestCommandStatus(id, patch) {
+  if (!id) {
+    return null;
+  }
+
+  const current = testCommandStatuses.get(id) || {
+    id,
+    stage: "queued",
+    updatedAt: new Date().toISOString()
+  };
+  const next = {
+    ...current,
+    ...patch,
+    id,
+    updatedAt: new Date().toISOString()
+  };
+
+  testCommandStatuses.set(id, next);
+
+  if (testCommandStatuses.size > 40) {
+    const oldest = testCommandStatuses.keys().next().value;
+    testCommandStatuses.delete(oldest);
+  }
+
+  return next;
+}
+
+function documentMatchesTestCommand(command, document) {
+  const target = String(command.documentTitle || command.documentKey || "").trim().toLowerCase();
+  if (!target) {
+    return true;
+  }
+
+  const normalized = normalizeTestDocument(document);
+  if (!normalized) {
+    return false;
+  }
+
+  return [normalized.key, normalized.title, normalized.name, normalized.fullName]
+    .filter(Boolean)
+    .some((value) => value.toLowerCase().includes(target));
+}
+
+async function handleTestCommandPush(req, res) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    sendJson(res, 400, {
+      error: {
+        message: "Invalid JSON body"
+      }
+    });
+    return;
+  }
+
+  const prompt = String(body?.prompt ?? "");
+  if (!prompt.trim()) {
+    sendJson(res, 400, {
+      error: {
+        message: "Prompt is required"
+      }
+    });
+    return;
+  }
+
+  const id = `test-${Date.now()}-${++testCommandSeq}`;
+  pendingTestCommand = {
+    id,
+    prompt,
+    documentTitle: String(body?.documentTitle ?? ""),
+    documentKey: String(body?.documentKey ?? ""),
+    visibleDelayMs: Math.min(8000, Math.max(600, Number(body?.visibleDelayMs) || 1800)),
+    createdAt: new Date().toISOString()
+  };
+
+  rememberTestCommandStatus(id, {
+    stage: "queued",
+    command: {
+      id,
+      documentTitle: pendingTestCommand.documentTitle,
+      documentKey: pendingTestCommand.documentKey,
+      promptLength: prompt.length,
+      visibleDelayMs: pendingTestCommand.visibleDelayMs
+    }
+  });
+
+  sendJson(res, 200, {
+    ok: true,
+    id,
+    stage: "queued"
+  });
+}
+
+async function handleTestCommandPoll(req, res) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    sendJson(res, 400, {
+      error: {
+        message: "Invalid JSON body"
+      }
+    });
+    return;
+  }
+
+  if (!pendingTestCommand) {
+    sendJson(res, 200, {
+      ok: true,
+      command: null
+    });
+    return;
+  }
+
+  if (!documentMatchesTestCommand(pendingTestCommand, body?.document)) {
+    sendJson(res, 200, {
+      ok: true,
+      command: null
+    });
+    return;
+  }
+
+  const command = pendingTestCommand;
+  pendingTestCommand = null;
+  rememberTestCommandStatus(command.id, {
+    stage: "delivered",
+    document: normalizeTestDocument(body?.document)
+  });
+
+  sendJson(res, 200, {
+    ok: true,
+    command
+  });
+}
+
+async function handleTestCommandAck(req, res) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    sendJson(res, 400, {
+      error: {
+        message: "Invalid JSON body"
+      }
+    });
+    return;
+  }
+
+  const id = String(body?.id ?? "");
+  if (!id) {
+    sendJson(res, 400, {
+      error: {
+        message: "Command id is required"
+      }
+    });
+    return;
+  }
+
+  const status = rememberTestCommandStatus(id, {
+    stage: String(body?.stage ?? "ack"),
+    document: normalizeTestDocument(body?.document),
+    detail: body?.detail || {}
+  });
+
+  sendJson(res, 200, {
+    ok: true,
+    status
+  });
+}
+
+function handleTestCommandStatus(res, requestUrl) {
+  const id = String(requestUrl.searchParams.get("id") ?? "");
+  if (!id) {
+    sendJson(res, 400, {
+      error: {
+        message: "Command id is required"
+      }
+    });
+    return;
+  }
+
+  sendJson(res, 200, {
+    ok: true,
+    status: testCommandStatuses.get(id) || null
+  });
 }
 
 function resolveRelayAuthorization(req, body = null) {
@@ -1354,6 +1558,9 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  const requestUrl = new URL(req.url, "http://127.0.0.1");
+  const pathname = requestUrl.pathname;
+
   if (req.method === "OPTIONS") {
     setCorsHeaders(res, req);
     res.writeHead(204);
@@ -1361,7 +1568,7 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "GET" && req.url === "/health") {
+  if (req.method === "GET" && pathname === "/health") {
     sendJson(res, 200, {
       ok: true,
       provider: "nvidia-relay",
@@ -1372,7 +1579,7 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "GET" && req.url === "/bootstrap") {
+  if (req.method === "GET" && pathname === "/bootstrap") {
     sendJson(res, 200, {
       ok: true,
       settings: BOOTSTRAP_SETTINGS
@@ -1380,33 +1587,53 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "GET" && req.url === "/nvidia/v1/models") {
+  if (req.method === "GET" && pathname === "/nvidia/v1/models") {
     await handleNvidiaModels(req, res);
     return;
   }
 
-  if (req.method === "POST" && req.url === "/nvidia/v1/models/benchmark") {
+  if (req.method === "POST" && pathname === "/nvidia/v1/models/benchmark") {
     await handleNvidiaBenchmark(req, res);
     return;
   }
 
-  if (req.method === "POST" && req.url === "/nvidia/v1/chat/completions") {
+  if (req.method === "POST" && pathname === "/nvidia/v1/chat/completions") {
     await handleNvidiaChat(req, res);
     return;
   }
 
-  if (req.method === "POST" && req.url === "/session/load") {
+  if (req.method === "POST" && pathname === "/session/load") {
     await handleSessionLoad(req, res);
     return;
   }
 
-  if (req.method === "POST" && req.url === "/session/save") {
+  if (req.method === "POST" && pathname === "/session/save") {
     await handleSessionSave(req, res);
     return;
   }
 
-  if (req.method === "POST" && req.url === "/session/delete") {
+  if (req.method === "POST" && pathname === "/session/delete") {
     await handleSessionDelete(req, res);
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/test-command") {
+    await handleTestCommandPush(req, res);
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/test-command/poll") {
+    await handleTestCommandPoll(req, res);
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/test-command/ack") {
+    await handleTestCommandAck(req, res);
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/test-command/status") {
+    handleTestCommandStatus(res, requestUrl);
     return;
   }
 
