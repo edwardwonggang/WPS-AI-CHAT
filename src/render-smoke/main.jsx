@@ -11,7 +11,7 @@ const SAMPLES = [
     id: "heading-paragraph",
     label: "Heading and Body",
     markdown:
-      "# Primary Heading\n\n## Secondary Heading\n\n### Third Heading\n\nThis is the first body paragraph used to verify standard paragraph formatting.",
+      "# Primary Heading\n\n## Secondary Heading\n\n### Third Heading\n\nThis is the first body paragraph used to verify standard paragraph formatting with **bold text** and *italic text*.",
     verifyChat(root) {
       return Boolean(root.querySelector("h1") && root.querySelector("p"));
     },
@@ -21,6 +21,8 @@ const SAMPLES = [
         output.stream.includes("1.1 Secondary Heading") &&
         output.stream.includes("1.1.1 Third Heading") &&
         output.stream.includes("first body paragraph") &&
+        output.ranges.some((record) => record.font.Bold === 1) &&
+        output.ranges.some((record) => record.font.Italic === 1) &&
         output.ranges.some(
           (record) =>
             record.paragraph.Alignment === 0 &&

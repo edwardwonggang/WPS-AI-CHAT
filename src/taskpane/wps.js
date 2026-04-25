@@ -589,6 +589,14 @@ function applyParagraphFormat(range, kind, depth = 0) {
     leftIndent = 2;
   }
 
+  if (kind === "quote") {
+    try {
+      range.Font.Color = cssColorToWpsColor("#57606a");
+    } catch {
+      // Some hosts may not expose font color on paragraph ranges.
+    }
+  }
+
   forEachParagraph(range, (_paragraphRange, paragraph) => {
     setParagraphNumeric(paragraph, "Alignment", ALIGN_LEFT);
     setParagraphNumeric(paragraph, "CharacterUnitLeftIndent", leftIndent);
@@ -1572,11 +1580,17 @@ function appendText(state, text) {
 
   const parts = normalized.split("\n");
   const style = currentTextStyle(state);
+  const quote = findLastContext(state, (entry) => entry.type === BLOCKQUOTE);
 
   parts.forEach((part, index) => {
-    if (part) {
+    let textPart = part;
+    if (quote) {
+      textPart = textPart.replace(/^>\s?/, "");
+    }
+
+    if (textPart) {
       consumeLinePrefix(state);
-      queueText(state, part, style);
+      queueText(state, textPart, style);
     }
 
     if (index < parts.length - 1) {
