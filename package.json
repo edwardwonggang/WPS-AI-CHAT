@@ -5,16 +5,25 @@
 	"addonType": "wps",
 	"description": "WPS AI plugin with OpenRouter/NVIDIA support and streaming document output",
 	"scripts": {
-		"dev": "vite --port 3890",
+		"dev": "vite --port 3889",
 		"build": "vite build && powershell -ExecutionPolicy Bypass -File .\\server\\install-local-addon.ps1",
 		"preview": "vite preview",
+		"test:render-smoke": "node .\\scripts\\run-render-smoke.mjs",
 		"debug": "powershell -ExecutionPolicy Bypass -File .\\server\\start-relay.ps1 && wpsjs debug",
 		"relay": "node server/relay.mjs"
 	},
 	"dependencies": {
+		"highlight.js": "^11.11.1",
+		"katex": "^0.16.45",
 		"lucide-react": "^1.8.0",
 		"react": "^18.3.1",
 		"react-dom": "^18.3.1",
+		"react-markdown": "^10.1.0",
+		"rehype-highlight": "^7.0.2",
+		"rehype-katex": "^7.0.1",
+		"rehype-raw": "^7.0.0",
+		"remark-gfm": "^4.0.1",
+		"remark-math": "^6.0.0",
 		"streaming-markdown": "^0.2.15"
 	},
 	"devDependencies": {

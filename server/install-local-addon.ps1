@@ -7,6 +7,21 @@ $addonRoot = Join-Path $env:APPDATA "kingsoft\wps\jsaddons"
 $runKeyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $runValueName = "WPS AI Relay"
 $runVbsPath = Join-Path $PSScriptRoot "run-relay-hidden.vbs"
+$runVbsContent = @'
+Set shell = CreateObject("WScript.Shell")
+
+Dim fso
+Dim scriptDir
+Dim relayScript
+Dim command
+
+Set fso = CreateObject("Scripting.FileSystemObject")
+scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
+relayScript = fso.BuildPath(scriptDir, "start-relay.ps1")
+command = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File """ & relayScript & """"
+
+shell.Run command, 0, False
+'@
 
 if (!(Test-Path $packageJsonPath)) {
   throw "package.json not found."
@@ -28,6 +43,7 @@ New-Item -ItemType Directory -Path $addonRoot -Force | Out-Null
 Get-ChildItem -Path $addonRoot -Directory -Filter "${addonName}_*" -ErrorAction SilentlyContinue |
   Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 Copy-Item $buildDir $offlineTarget -Recurse -Force
+Set-Content -Path $runVbsPath -Value $runVbsContent -Encoding ASCII
 
 [xml]$xml = if (Test-Path $publishXmlPath) {
   Get-Content $publishXmlPath -Raw
@@ -76,7 +92,7 @@ $writer.Close()
 New-Item -Path $runKeyPath -Force | Out-Null
 Set-ItemProperty -Path $runKeyPath -Name $runValueName -Value "wscript.exe `"$runVbsPath`""
 
-& powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "start-relay.ps1")
+& powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "start-relay.ps1") -ForceRestart
 
 Write-Output "Installed addon to $offlineTarget"
 Write-Output "Updated publish.xml at $publishXmlPath"

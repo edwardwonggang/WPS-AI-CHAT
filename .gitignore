@@ -4,3 +4,11 @@ dist/
 .publishTemp/
 *.7z
 *.exe
+render-smoke-edge.log
+render-smoke-dom.html
+render-smoke-dom-new.html
+WPS_TEST_LOG.md
+wps-*.png
+wps-*.log
+wpsjs-*.log
+wpsjs-debug.log

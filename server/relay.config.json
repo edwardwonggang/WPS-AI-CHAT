@@ -1,5 +1,5 @@
 {
-  "proxyUrl": "http://127.0.0.1:7890",
+  "proxyUrl": "http://proxy.zte.com.cn:80",
   "defaults": {
     "providerId": "nvidia",
     "baseUrl": "http://127.0.0.1:3888/nvidia/v1",
@@ -7,7 +7,7 @@
     "model": "deepseek-ai/deepseek-v3.1-terminus",
     "temperature": 0.5,
     "maxTokens": "",
-    "systemPrompt": "你是 WPS 写作助手。请直接输出适合插入正文的 Markdown 内容，仅在有助于可读性时使用标题、列表、加粗和斜体，不要添加寒暄、前言或解释性套话。",
+    "systemPrompt": "You are the WPS writing assistant. Output Markdown suitable for direct insertion into the document body. Use headings, lists, bold, and italics only when they improve readability. Do not add greetings, prefaces, or explanatory filler.",
     "useSelectionAsContext": true,
     "replaceSelection": true,
     "firstTokenTimeoutMs": 120000

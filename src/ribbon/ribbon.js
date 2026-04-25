@@ -1,3 +1,5 @@
+import { tryStartLocalRelay } from "../shared/relay";
+
 const STORAGE_KEY = "wps_ai_taskpane_id";
 
 function getDockRightValue() {
@@ -39,13 +41,24 @@ const ribbon = {
       window.Application.ribbonUI = ribbonUI;
     }
 
+    tryStartLocalRelay();
+
+    try {
+      if (window.Application?.ActiveDocument) {
+        const taskPane = ensureTaskPane();
+        taskPane.Visible = true;
+      }
+    } catch {
+      // Ignore auto-open failures in host startup.
+    }
+
     return true;
   },
 
   OnAction(control) {
     const doc = window.Application?.ActiveDocument;
     if (!doc) {
-      alert("当前没有打开任何文字文档。");
+      alert("No text document is currently open.");
       return true;
     }
 

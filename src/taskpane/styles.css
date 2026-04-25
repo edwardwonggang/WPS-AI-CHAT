@@ -235,8 +235,8 @@ summary:focus-visible {
 
 .bubble-markdown {
   color: inherit;
-  font-size: 12.5px;
-  line-height: 1.82;
+  font-size: 13px;
+  line-height: 1.76;
   word-break: break-word;
 }
 
@@ -259,8 +259,8 @@ summary:focus-visible {
 }
 
 .bubble-markdown p {
-  text-indent: 2em;
-  text-align: justify;
+  text-indent: 0;
+  text-align: left;
 }
 
 .bubble-markdown h1,
@@ -270,16 +270,17 @@ summary:focus-visible {
 .bubble-markdown h5,
 .bubble-markdown h6 {
   margin: 0 0 0.7em;
-  line-height: 1.35;
-  letter-spacing: -0.01em;
+  line-height: 1.3;
+  letter-spacing: -0.015em;
+  font-weight: 650;
 }
 
 .bubble-markdown h1 {
-  font-size: 16px;
+  font-size: 18px;
 }
 
 .bubble-markdown h2 {
-  font-size: 15px;
+  font-size: 16px;
 }
 
 .bubble-markdown h3,
@@ -291,12 +292,16 @@ summary:focus-visible {
 
 .bubble-markdown ul,
 .bubble-markdown ol {
-  padding-left: 1.55em;
-  margin-left: 0.2em;
+  padding-left: 1.35em;
+  margin-left: 0;
 }
 
 .bubble-markdown li + li {
-  margin-top: 0.28em;
+  margin-top: 0.24em;
+}
+
+.bubble-markdown li {
+  overflow-wrap: anywhere;
 }
 
 .bubble-markdown li > p,
@@ -313,10 +318,12 @@ summary:focus-visible {
 }
 
 .bubble-markdown blockquote {
-  margin-left: 0.2em;
-  padding: 0.18em 0 0.18em 1em;
-  border-left: 2px solid rgba(17, 17, 17, 0.14);
-  color: var(--muted);
+  margin-left: 0;
+  padding: 0.25em 0 0.25em 0.95em;
+  border-left: 3px solid rgba(0, 113, 227, 0.24);
+  color: #5f6b7a;
+  background: rgba(0, 113, 227, 0.04);
+  border-radius: 0 12px 12px 0;
 }
 
 .bubble-markdown blockquote ul,
@@ -325,42 +332,105 @@ summary:focus-visible {
 }
 
 .bubble-markdown code {
-  padding: 0.12em 0.42em;
-  border-radius: 8px;
-  background: var(--surface-strong);
+  padding: 0.16em 0.42em;
+  border-radius: 7px;
+  border: 1px solid rgba(17, 17, 17, 0.08);
+  background: rgba(17, 17, 17, 0.05);
   font-family: "Cascadia Code", Consolas, monospace;
   font-size: 12px;
 }
 
 .bubble-markdown pre {
   overflow-x: auto;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  background: var(--surface);
+  padding: 13px 14px;
+  border: 1px solid rgba(17, 17, 17, 0.08);
+  border-radius: 16px;
+  background: #f6f8fb;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
 }
 
 .bubble-markdown pre code {
   padding: 0;
+  border: 0;
   background: transparent;
+  font-size: 12.5px;
+  line-height: 1.65;
 }
 
 .bubble-markdown hr {
   height: 1px;
   border: 0;
-  background: var(--line);
+  background: rgba(17, 17, 17, 0.1);
 }
 
 .bubble-markdown table {
   width: 100%;
   border-collapse: collapse;
+  overflow: hidden;
+  border-radius: 14px;
+  border-style: hidden;
+  box-shadow: 0 0 0 1px rgba(17, 17, 17, 0.08);
 }
 
 .bubble-markdown th,
 .bubble-markdown td {
-  padding: 7px 8px;
-  border: 1px solid var(--line);
+  padding: 8px 10px;
+  border: 1px solid rgba(17, 17, 17, 0.08);
   text-align: left;
+}
+
+.bubble-markdown th {
+  font-weight: 600;
+  background: rgba(17, 17, 17, 0.04);
+}
+
+.bubble-markdown tr:nth-child(even) td {
+  background: rgba(17, 17, 17, 0.02);
+}
+
+.bubble-markdown .task-list-item {
+  list-style: none;
+  margin-left: -0.15em;
+}
+
+.bubble-markdown .task-list-item input[type="checkbox"] {
+  margin-right: 0.55em;
+  transform: translateY(1px);
+}
+
+.bubble-markdown .contains-task-list {
+  padding-left: 0.2em;
+}
+
+.bubble-markdown .katex-display {
+  margin: 0.9em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.bubble-markdown .katex {
+  font-size: 1.02em;
+}
+
+.bubble-markdown sup,
+.bubble-markdown sub {
+  line-height: 0;
+}
+
+.bubble-markdown .footnotes {
+  margin-top: 1.1em;
+  padding-top: 0.9em;
+  border-top: 1px solid rgba(17, 17, 17, 0.1);
+  color: #445164;
+}
+
+.bubble-markdown .footnotes ol {
+  margin-bottom: 0;
+}
+
+.bubble-markdown .footnote-backref {
+  margin-left: 0.35em;
+  text-decoration: none;
 }
 
 .bubble-row.user .bubble-markdown blockquote,
@@ -374,8 +444,31 @@ summary:focus-visible {
 
 .bubble-row.user .bubble-markdown code,
 .bubble-row.user .bubble-markdown pre {
-  border-color: rgba(255, 255, 255, 0.18);
+  border-color: rgba(255, 255, 255, 0.12);
   background: rgba(255, 255, 255, 0.08);
+}
+
+.bubble-row.user .bubble-markdown blockquote {
+  background: rgba(255, 255, 255, 0.06);
+  border-left-color: rgba(141, 197, 255, 0.48);
+}
+
+.bubble-row.user .bubble-markdown .footnotes {
+  border-top-color: rgba(255, 255, 255, 0.16);
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.bubble-markdown pre code.hljs {
+  background: transparent;
+}
+
+.bubble-markdown .hljs {
+  color: #243245;
+}
+
+.bubble-row.user .bubble-markdown .hljs,
+.bubble-row.user .bubble-markdown pre code.hljs {
+  color: rgba(255, 255, 255, 0.92);
 }
 
 .minimal-composer {
@@ -391,6 +484,15 @@ summary:focus-visible {
   border-radius: 14px;
   color: var(--danger);
   background: rgba(255, 247, 246, 0.88);
+  font-size: 12px;
+}
+
+.tiny-status {
+  padding: 9px 11px;
+  border: 1px solid rgba(0, 113, 227, 0.12);
+  border-radius: 14px;
+  color: var(--accent-strong);
+  background: rgba(0, 113, 227, 0.06);
   font-size: 12px;
 }
 
@@ -644,6 +746,70 @@ summary:focus-visible {
   margin-bottom: 10px;
 }
 
+.log-toolbar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.log-list {
+  display: grid;
+  gap: 8px;
+  max-height: 62vh;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.log-entry {
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.78);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.88);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.04);
+}
+
+.log-entry.error {
+  border-color: #f2d1cc;
+  background: #fff7f6;
+}
+
+.log-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.log-message {
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.log-details {
+  margin: 8px 0 0;
+  padding: 10px 11px;
+  overflow: auto;
+  border: 1px solid rgba(17, 17, 17, 0.08);
+  border-radius: 12px;
+  background: rgba(245, 245, 247, 0.92);
+  color: #243245;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log-empty {
+  padding: 18px 14px;
+  border-radius: 16px;
+  color: var(--muted);
+  background: rgba(245, 245, 247, 0.82);
+  text-align: center;
+}
+
 .lab-actions {
   display: flex;
   gap: 8px;
@@ -784,11 +950,13 @@ summary:focus-visible {
   }
 
   .lab-toolbar,
-  .lab-actions {
+  .lab-actions,
+  .log-toolbar {
     flex-direction: column;
   }
 
-  .lab-actions .secondary-button {
+  .lab-actions .secondary-button,
+  .log-toolbar .secondary-button {
     width: 100%;
   }
 

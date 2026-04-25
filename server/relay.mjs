@@ -17,6 +17,8 @@ const NVIDIA_MODELS_UPSTREAM = "https://integrate.api.nvidia.com/v1/models";
 const OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
 const CURL_BIN = process.platform === "win32" ? "curl.exe" : "curl";
 const RELAY_CONFIG_URL = new URL("./relay.config.json", import.meta.url);
+const DEFAULT_EXTERNAL_PROXY = "http://proxy.zte.com.cn:80";
+const LOCAL_NO_PROXY = "127.0.0.1,localhost,::1";
 const DEFAULT_BENCHMARK_TIMEOUT_MS = 12000;
 const DEFAULT_BENCHMARK_CONCURRENCY = 6;
 const DEFAULT_SESSION_ROOT =
@@ -38,7 +40,7 @@ const DEFAULT_BOOTSTRAP_SETTINGS = Object.freeze({
   temperature: 0.5,
   maxTokens: "",
   systemPrompt:
-    "你是 WPS 写作助手。请直接输出适合插入正文的 Markdown 内容，仅在有助于可读性时使用标题、列表、加粗和斜体，不要添加寒暄、前言或解释性套话。",
+    "You are the WPS writing assistant. Output Markdown suitable for direct insertion into the document body. Use headings, lists, bold, and italics only when they improve readability. Do not add greetings, prefaces, or explanatory filler.",
   useSelectionAsContext: true,
   replaceSelection: true,
   firstTokenTimeoutMs: 120000
@@ -131,14 +133,27 @@ function resolveWindowsProxy() {
 function resolveProxyEnv(config) {
   const proxy =
     resolveConfigProxy(config) ||
+    DEFAULT_EXTERNAL_PROXY ||
     process.env.HTTPS_PROXY ||
     process.env.HTTP_PROXY ||
     process.env.https_proxy ||
     process.env.http_proxy ||
     (process.platform === "win32" ? resolveWindowsProxy() : "");
 
+  const noProxy = [
+    LOCAL_NO_PROXY,
+    process.env.NO_PROXY || "",
+    process.env.no_proxy || ""
+  ]
+    .filter(Boolean)
+    .join(",");
+
   if (!proxy) {
-    return process.env;
+    return {
+      ...process.env,
+      NO_PROXY: noProxy,
+      no_proxy: noProxy
+    };
   }
 
   return {
@@ -147,9 +162,42 @@ function resolveProxyEnv(config) {
     HTTPS_PROXY: proxy,
     http_proxy: proxy,
     https_proxy: proxy,
-    NO_PROXY: process.env.NO_PROXY || "127.0.0.1,localhost",
-    no_proxy: process.env.no_proxy || "127.0.0.1,localhost"
+    NO_PROXY: noProxy,
+    no_proxy: noProxy
   };
+}
+
+function createDirectEnv(baseEnv) {
+  return {
+    ...baseEnv,
+    HTTP_PROXY: "",
+    HTTPS_PROXY: "",
+    http_proxy: "",
+    https_proxy: "",
+    ALL_PROXY: "",
+    all_proxy: "",
+    NO_PROXY: baseEnv.NO_PROXY || LOCAL_NO_PROXY,
+    no_proxy: baseEnv.no_proxy || LOCAL_NO_PROXY
+  };
+}
+
+function hasProxyConfigured(env) {
+  return Boolean(
+    String(env?.HTTPS_PROXY || env?.HTTP_PROXY || env?.https_proxy || env?.http_proxy || "")
+      .trim()
+  );
+}
+
+function isProxyConnectionFailure(message) {
+  const normalized = String(message || "");
+  return (
+    /proxy/i.test(normalized) ||
+    /failed to connect to 127\.0\.0\.1 port \d+/i.test(normalized) ||
+    /failed to connect to localhost port \d+/i.test(normalized) ||
+    /could not connect to server/i.test(normalized) ||
+    /connection refused/i.test(normalized) ||
+    /proxyconnect/i.test(normalized)
+  );
 }
 
 function normalizeBootstrapSettings(config) {
@@ -207,7 +255,7 @@ function normalizeSessionRoot(config) {
 
 function normalizeSessionDocument(input) {
   const title =
-    String(input?.title ?? input?.name ?? "").trim() || "未命名文档";
+    String(input?.title ?? input?.name ?? "").trim() || "Untitled Document";
   const path = String(input?.path ?? "").trim();
   let fullName = String(input?.fullName ?? "").trim();
 
@@ -248,7 +296,7 @@ function sanitizeSessionFileLabel(value) {
     .replace(/\s+/g, " ")
     .trim();
 
-  return cleaned.slice(0, 80) || "未命名文档";
+  return cleaned.slice(0, 80) || "Untitled Document";
 }
 
 function escapeSessionAttribute(value) {
@@ -293,7 +341,7 @@ function serializeSessionMarkdown(document, messages) {
     "-->",
     `# ${document.title}`,
     "",
-    "> 由 WPS AI 自动维护的对话记录。",
+    "> Conversation history maintained automatically by WPS AI.",
     "",
     blocks.join("\n\n")
   ]
@@ -323,13 +371,27 @@ function parseSessionMarkdown(markdown) {
 
 const RELAY_CONFIG = readRelayConfig();
 const PROXY_ENV = resolveProxyEnv(RELAY_CONFIG);
+const DIRECT_ENV = createDirectEnv(process.env);
 const BOOTSTRAP_SETTINGS = normalizeBootstrapSettings(RELAY_CONFIG);
 const SESSION_ROOT = normalizeSessionRoot(RELAY_CONFIG);
 
-function setCorsHeaders(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+function setCorsHeaders(res, req = null) {
+  const origin = req?.headers?.origin;
+  const requestHeaders = req?.headers?.["access-control-request-headers"];
+  const requestPrivateNetwork = req?.headers?.["access-control-request-private-network"];
+
+  res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  res.setHeader("Vary", "Origin, Access-Control-Request-Headers, Access-Control-Request-Private-Network");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "authorization,content-type");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    requestHeaders || "authorization,content-type,accept"
+  );
+  res.setHeader("Access-Control-Max-Age", "600");
+
+  if (requestPrivateNetwork === "true") {
+    res.setHeader("Access-Control-Allow-Private-Network", "true");
+  }
 }
 
 function sendJson(res, statusCode, payload) {
@@ -340,6 +402,14 @@ function sendJson(res, statusCode, payload) {
 
 function sendSse(res, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function relayLog(scope, message, details = undefined) {
+  const suffix =
+    details && typeof details === "object" && Object.keys(details).length > 0
+      ? ` ${JSON.stringify(details)}`
+      : "";
+  console.log(`[relay] [${scope}] ${message}${suffix}`);
 }
 
 async function readJsonBody(req) {
@@ -354,6 +424,39 @@ async function readJsonBody(req) {
   }
 
   return JSON.parse(raw);
+}
+
+async function readFormBody(req) {
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(chunk);
+  }
+
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  if (!raw) {
+    return {};
+  }
+
+  const params = new URLSearchParams(raw);
+  return Object.fromEntries(params.entries());
+}
+
+function resolveRelayAuthorization(req, body = null) {
+  const headerValue = String(req.headers.authorization || "").trim();
+  if (headerValue) {
+    return headerValue;
+  }
+
+  const apiKey = String(body?.apiKey ?? "").trim();
+  if (!apiKey) {
+    return "";
+  }
+
+  if (/^Bearer\s+/i.test(apiKey)) {
+    return apiKey;
+  }
+
+  return `Bearer ${apiKey}`;
 }
 
 function formatCurlFailure(stderr) {
@@ -460,54 +563,80 @@ function runCurlBuffered({
   headers = [],
   body = ""
 }) {
-  return new Promise((resolve, reject) => {
-    const curl = spawn(
-      CURL_BIN,
-      createCurlArgs({
-        authorization,
-        url,
-        method,
-        headers,
-        dataFromStdin: method !== "GET"
-      }),
-      {
-        env: PROXY_ENV,
-        stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: true
-      }
-    );
+  const attempts = hasProxyConfigured(PROXY_ENV)
+    ? [
+        { env: PROXY_ENV, label: "proxy" },
+        { env: DIRECT_ENV, label: "direct" }
+      ]
+    : [{ env: PROXY_ENV, label: "direct" }];
 
-    let stdout = "";
-    let stderr = "";
+  function runAttempt(index) {
+    return new Promise((resolve, reject) => {
+      const attempt = attempts[index];
+      const curl = spawn(
+        CURL_BIN,
+        createCurlArgs({
+          authorization,
+          url,
+          method,
+          headers,
+          dataFromStdin: method !== "GET"
+        }),
+        {
+          env: attempt.env,
+          stdio: ["pipe", "pipe", "pipe"],
+          windowsHide: true
+        }
+      );
 
-    curl.on("error", (error) => {
-      reject(error instanceof Error ? error : new Error("Failed to start curl"));
-    });
+      let stdout = "";
+      let stderr = "";
 
-    curl.stdout.on("data", (chunk) => {
-      stdout += chunk.toString("utf8");
-    });
+      curl.on("error", (error) => {
+        reject(error instanceof Error ? error : new Error("Failed to start curl"));
+      });
 
-    curl.stderr.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
-    });
+      curl.stdout.on("data", (chunk) => {
+        stdout += chunk.toString("utf8");
+      });
 
-    curl.on("close", (code) => {
-      if (code === 0) {
-        resolve(stdout);
+      curl.stderr.on("data", (chunk) => {
+        stderr += chunk.toString("utf8");
+      });
+
+      curl.on("close", (code) => {
+        if (code === 0) {
+          resolve(stdout);
+          return;
+        }
+
+        const message = formatCurlFailure(stderr || stdout);
+        if (
+          attempt.label === "proxy" &&
+          index + 1 < attempts.length &&
+          isProxyConnectionFailure(message)
+        ) {
+          relayLog("proxy", "Proxy attempt failed for a buffered NVIDIA request. Retrying direct.", {
+            url,
+            message
+          });
+          resolve(runAttempt(index + 1));
+          return;
+        }
+
+        reject(new Error(message));
+      });
+
+      if (method === "GET") {
+        curl.stdin.end();
         return;
       }
 
-      reject(new Error(formatCurlFailure(stderr || stdout)));
+      curl.stdin.end(body);
     });
+  }
 
-    if (method === "GET") {
-      curl.stdin.end();
-      return;
-    }
-
-    curl.stdin.end(body);
-  });
+  return runAttempt(0);
 }
 
 async function listNvidiaModels(authorization) {
@@ -585,28 +714,18 @@ function classifyBenchmarkFailure(stderr) {
 function benchmarkModel(authorization, model, timeoutMs) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
-    const curl = spawn(
-      CURL_BIN,
-      createCurlArgs({
-        authorization,
-        url: NVIDIA_CHAT_UPSTREAM,
-        method: "POST",
-        headers: ["Content-Type: application/json"],
-        dataFromStdin: true,
-        stream: true
-      }),
-      {
-        env: PROXY_ENV,
-        stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: true
-      }
-    );
-
-    let stderr = "";
     let buffer = "";
     let firstByteMs = null;
     let firstTokenMs = null;
     let settled = false;
+    let activeCurl = null;
+
+    const attempts = hasProxyConfigured(PROXY_ENV)
+      ? [
+          { env: PROXY_ENV, label: "proxy" },
+          { env: DIRECT_ENV, label: "direct" }
+        ]
+      : [{ env: PROXY_ENV, label: "direct" }];
 
     function finalize(status, message) {
       if (settled) {
@@ -617,7 +736,7 @@ function benchmarkModel(authorization, model, timeoutMs) {
       clearTimeout(timeoutId);
 
       try {
-        curl.kill();
+        activeCurl?.kill();
       } catch {
         // Ignore kill failures after process exit.
       }
@@ -638,50 +757,94 @@ function benchmarkModel(authorization, model, timeoutMs) {
       finalize("timeout", "Timed out before first content token.");
     }, timeoutMs);
 
-    curl.on("error", (error) => {
-      finalize("error", error instanceof Error ? error.message : "Failed to start curl");
-    });
+    function startAttempt(index) {
+      const attempt = attempts[index];
+      let stderr = "";
+      let attemptCompleted = false;
 
-    curl.stderr.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
-    });
+      activeCurl = spawn(
+        CURL_BIN,
+        createCurlArgs({
+          authorization,
+          url: NVIDIA_CHAT_UPSTREAM,
+          method: "POST",
+          headers: ["Content-Type: application/json"],
+          dataFromStdin: true,
+          stream: true
+        }),
+        {
+          env: attempt.env,
+          stdio: ["pipe", "pipe", "pipe"],
+          windowsHide: true
+        }
+      );
 
-    curl.stdout.on("data", (chunk) => {
-      if (firstByteMs === null) {
-        firstByteMs = Math.max(0, Date.now() - startedAt);
-      }
+      activeCurl.on("error", (error) => {
+        finalize("error", error instanceof Error ? error.message : "Failed to start curl");
+      });
 
-      buffer += chunk.toString("utf8");
-      const parts = buffer.split(/\r?\n\r?\n/);
-      buffer = parts.pop() ?? "";
+      activeCurl.stderr.on("data", (chunk) => {
+        stderr += chunk.toString("utf8");
+      });
 
-      for (const part of parts) {
-        const payload = parseSseEvent(part);
-        const text = extractChunk(payload);
+      activeCurl.stdout.on("data", (chunk) => {
+        if (firstByteMs === null) {
+          firstByteMs = Math.max(0, Date.now() - startedAt);
+        }
 
-        if (text && firstTokenMs === null) {
-          firstTokenMs = Math.max(0, Date.now() - startedAt);
+        buffer += chunk.toString("utf8");
+        const parts = buffer.split(/\r?\n\r?\n/);
+        buffer = parts.pop() ?? "";
+
+        for (const part of parts) {
+          const payload = parseSseEvent(part);
+          const text = extractChunk(payload);
+
+          if (text && firstTokenMs === null) {
+            firstTokenMs = Math.max(0, Date.now() - startedAt);
+            finalize("ok", "");
+            return;
+          }
+        }
+      });
+
+      activeCurl.on("close", () => {
+        if (settled) {
+          return;
+        }
+
+        if (attemptCompleted) {
+          return;
+        }
+        attemptCompleted = true;
+
+        if (firstTokenMs !== null) {
           finalize("ok", "");
           return;
         }
-      }
-    });
 
-    curl.on("close", () => {
-      if (settled) {
-        return;
-      }
+        const failure = classifyBenchmarkFailure(stderr);
+        if (
+          attempt.label === "proxy" &&
+          index + 1 < attempts.length &&
+          firstByteMs === null &&
+          isProxyConnectionFailure(failure.message)
+        ) {
+          relayLog("proxy", "Proxy attempt failed during model benchmark. Retrying direct.", {
+            model,
+            message: failure.message
+          });
+          startAttempt(index + 1);
+          return;
+        }
 
-      if (firstTokenMs !== null) {
-        finalize("ok", "");
-        return;
-      }
+        finalize(failure.status, failure.message);
+      });
 
-      const failure = classifyBenchmarkFailure(stderr);
-      finalize(failure.status, failure.message);
-    });
+      activeCurl.stdin.end(createBenchmarkBody(model));
+    }
 
-    curl.stdin.end(createBenchmarkBody(model));
+    startAttempt(0);
   });
 }
 
@@ -710,48 +873,62 @@ async function handleNvidiaModels(req, res) {
 }
 
 async function handleNvidiaChat(req, res) {
-  const authorization = req.headers.authorization;
-  if (!authorization) {
-    sendJson(res, 400, {
-      error: {
-        message: "Missing Authorization header"
-      }
-    });
-    return;
-  }
+  relayLog("chat", "Incoming NVIDIA chat request.", {
+    contentType: String(req.headers["content-type"] || ""),
+    hasAuthorizationHeader: Boolean(req.headers.authorization)
+  });
 
   let body;
   try {
-    body = await readJsonBody(req);
+    const contentType = String(req.headers["content-type"] || "").toLowerCase();
+    body = contentType.includes("application/x-www-form-urlencoded")
+      ? await readFormBody(req)
+      : await readJsonBody(req);
   } catch {
     sendJson(res, 400, {
       error: {
-        message: "Invalid JSON body"
+        message: "Invalid request body"
       }
     });
     return;
   }
 
-  const curl = spawn(
-    CURL_BIN,
-    createCurlArgs({
-      authorization,
-      url: NVIDIA_CHAT_UPSTREAM,
-      method: "POST",
-      headers: ["Content-Type: application/json"],
-      dataFromStdin: true,
-      stream: true
-    }),
-    {
-      env: PROXY_ENV,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true
-    }
-  );
+  const authorization = resolveRelayAuthorization(req, body);
+  if (!authorization) {
+    relayLog("chat", "Rejected chat request because the API key was missing.");
+    sendJson(res, 400, {
+      error: {
+        message: "Missing API key"
+      }
+    });
+    return;
+  }
 
-  let stderr = "";
+  if (typeof body?.payload === "string" && body.payload.trim()) {
+    try {
+      body = JSON.parse(body.payload);
+    } catch {
+      relayLog("chat", "Rejected chat request because the compatibility payload was invalid.");
+      sendJson(res, 400, {
+        error: {
+          message: "Invalid payload"
+        }
+      });
+      return;
+    }
+  }
+
   let streamStarted = false;
+  let upstreamDataReceived = false;
   let finished = false;
+  let activeCurl = null;
+
+  const attempts = hasProxyConfigured(PROXY_ENV)
+    ? [
+        { env: PROXY_ENV, label: "proxy" },
+        { env: DIRECT_ENV, label: "direct" }
+      ]
+    : [{ env: PROXY_ENV, label: "direct" }];
 
   function fail(message) {
     if (finished) {
@@ -760,68 +937,159 @@ async function handleNvidiaChat(req, res) {
 
     finished = true;
     if (!res.headersSent) {
+      relayLog("chat", "Returning buffered relay failure before the SSE stream started.", {
+        message
+      });
       sendJson(res, 502, { error: { message } });
       return;
     }
 
+    relayLog("chat", "Forwarding relay failure through SSE.", {
+      message
+    });
+    sendSse(res, {
+      error: {
+        message
+      }
+    });
     res.end();
   }
 
-  curl.on("error", (error) => {
-    fail(error instanceof Error ? error.message : "Failed to start curl");
-  });
+  function startAttempt(index) {
+    const attempt = attempts[index];
+    let stderr = "";
+    let attemptCompleted = false;
 
-  curl.stderr.on("data", (chunk) => {
-    stderr += chunk.toString("utf8");
-  });
+    activeCurl = spawn(
+      CURL_BIN,
+      createCurlArgs({
+        authorization,
+        url: NVIDIA_CHAT_UPSTREAM,
+        method: "POST",
+        headers: ["Content-Type: application/json"],
+        dataFromStdin: true,
+        stream: true
+      }),
+      {
+        env: attempt.env,
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true
+      }
+    );
 
-  curl.stdout.on("data", (chunk) => {
-    if (finished) {
-      return;
-    }
+    activeCurl.on("error", (error) => {
+      fail(error instanceof Error ? error.message : "Failed to start curl");
+    });
 
-    if (!streamStarted) {
-      setCorsHeaders(res);
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache"
+    activeCurl.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    activeCurl.stdout.on("data", (chunk) => {
+      if (finished) {
+        return;
+      }
+
+      if (!streamStarted) {
+        streamStarted = true;
+      }
+
+      upstreamDataReceived = true;
+      res.write(chunk);
+    });
+
+    activeCurl.stdout.on("end", () => {
+      if (finished) {
+        return;
+      }
+
+      if (attemptCompleted) {
+        return;
+      }
+      attemptCompleted = true;
+
+      if (!upstreamDataReceived) {
+        const message = formatCurlFailure(stderr || "NVIDIA upstream closed without any output.");
+        if (
+          attempt.label === "proxy" &&
+          index + 1 < attempts.length &&
+          isProxyConnectionFailure(message)
+        ) {
+          relayLog("proxy", "Proxy attempt failed during NVIDIA chat streaming. Retrying direct.", {
+            model: String(body?.model || ""),
+            message
+          });
+          startAttempt(index + 1);
+          return;
+        }
+
+        fail(message);
+        return;
+      }
+
+      relayLog("chat", "Completed NVIDIA chat stream.", {
+        stderr: stderr.trim()
       });
-      streamStarted = true;
-    }
+      finished = true;
+      res.end();
+    });
 
-    res.write(chunk);
-  });
+    activeCurl.on("close", (code) => {
+      if (finished) {
+        return;
+      }
 
-  curl.stdout.on("end", () => {
-    if (finished) {
-      return;
-    }
+      if (attemptCompleted) {
+        return;
+      }
+      attemptCompleted = true;
 
-    finished = true;
-    res.end();
-  });
+      if (!upstreamDataReceived) {
+        const message = formatCurlFailure(stderr || `curl exited with code ${code ?? "unknown"}`);
+        if (
+          attempt.label === "proxy" &&
+          index + 1 < attempts.length &&
+          isProxyConnectionFailure(message)
+        ) {
+          relayLog("proxy", "Proxy attempt closed before any NVIDIA chat data. Retrying direct.", {
+            model: String(body?.model || ""),
+            message
+          });
+          startAttempt(index + 1);
+          return;
+        }
 
-  curl.on("close", (code) => {
-    if (finished) {
-      return;
-    }
+        fail(message);
+        return;
+      }
 
-    if (!streamStarted) {
-      fail(formatCurlFailure(stderr || `curl exited with code ${code ?? "unknown"}`));
-      return;
-    }
+      finished = true;
+      res.end();
+    });
 
-    finished = true;
-    res.end();
-  });
+    activeCurl.stdin.end(JSON.stringify(body));
+  }
 
   req.on("aborted", () => {
     if (!finished) {
-      curl.kill();
+      activeCurl?.kill();
     }
   });
 
-  curl.stdin.end(JSON.stringify(body));
+  setCorsHeaders(res, req);
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no"
+  });
+  res.write(": stream-open\n\n");
+  streamStarted = true;
+
+  relayLog("chat", "Opened SSE stream to the WPS taskpane.", {
+    model: String(body?.model || "")
+  });
+  startAttempt(0);
 }
 
 async function handleNvidiaBenchmark(req, res) {
@@ -871,11 +1139,14 @@ async function handleNvidiaBenchmark(req, res) {
     ? Math.min(Math.max(Math.floor(Number(body.concurrency)), 1), 12)
     : DEFAULT_BENCHMARK_CONCURRENCY;
 
-  setCorsHeaders(res);
+  setCorsHeaders(res, req);
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache"
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no"
   });
+  res.write(": benchmark-open\n\n");
 
   let completed = 0;
   let cursor = 0;
@@ -1084,7 +1355,7 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === "OPTIONS") {
-    setCorsHeaders(res);
+    setCorsHeaders(res, req);
     res.writeHead(204);
     res.end();
     return;

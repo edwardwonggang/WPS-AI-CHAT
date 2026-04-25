@@ -114,25 +114,25 @@ function formatLatency(value) {
     return "";
   }
 
-  return `${Math.round(value)} 毫秒`;
+  return `${Math.round(value)} ms`;
 }
 
 export function benchmarkLabel(entry) {
   switch (entry.benchmark?.status ?? "untested") {
     case "ok":
       return entry.benchmark?.firstTokenMs
-        ? `首个有效输出 ${formatLatency(entry.benchmark.firstTokenMs)}`
-        : "可用";
+        ? `First valid output ${formatLatency(entry.benchmark.firstTokenMs)}`
+        : "Available";
     case "timeout":
-      return "响应超时";
+      return "Timed out";
     case "unsupported":
-      return "接口不兼容";
+      return "Unsupported";
     case "unauthorized":
-      return "当前密钥无权限";
+      return "Unauthorized";
     case "error":
-      return "请求异常";
+      return "Request failed";
     default:
-      return "未测速";
+      return "Not benchmarked";
   }
 }
 
@@ -143,16 +143,16 @@ export function benchmarkClassName(entry) {
 export function benchmarkStatusText(entry) {
   switch (entry.benchmark?.status ?? "untested") {
     case "ok":
-      return "可用";
+      return "Ready";
     case "timeout":
-      return "超时";
+      return "Timeout";
     case "unsupported":
-      return "不支持";
+      return "Unsupported";
     case "unauthorized":
-      return "无权限";
+      return "Unauthorized";
     case "error":
-      return "异常";
+      return "Error";
     default:
-      return "未测速";
+      return "Untested";
   }
 }

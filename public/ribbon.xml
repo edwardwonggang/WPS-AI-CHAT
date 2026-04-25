@@ -2,10 +2,10 @@
   <ribbon startFromScratch="false">
     <tabs>
       <tab id="wpsAiTab" label="WPS AI">
-        <group id="wpsAiGroup" label="智能写作">
+        <group id="wpsAiGroup" label="AI Writing">
           <button
             id="btnOpenAssistant"
-            label="打开 AI 助手"
+            label="Open AI Assistant"
             size="large"
             onAction="ribbon.OnAction"
             getImage="ribbon.GetImage"
