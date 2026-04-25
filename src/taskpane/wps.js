@@ -83,7 +83,8 @@ const PAPER_PARAGRAPH_INDENT_CHARS = 2;
 const CODE_LINE_NUMBER_SEPARATOR = "   ";
 const CODE_LINE_NUMBER_MIN_WIDTH = 2;
 const CODE_LINE_NUMBER_COLOR = "#8c959f";
-const CODE_BLOCK_BORDER_COLOR = "#ff3040";
+const CODE_BLOCK_BACKGROUND_COLOR = "#f6f8fa";
+const CODE_BLOCK_BORDER_COLOR = "#d0d7de";
 const HORIZONTAL_RULE_TEXT = "----------------";
 const RAW_BREAK_PLACEHOLDER = "WPS-BR-PLACEHOLDER-ZXCV";
 const RAW_CHECKED_PLACEHOLDER = "WPSCHECKEDBOXPLACEHOLDERZXCV";
@@ -690,7 +691,14 @@ function applyCodeFormat(range) {
 }
 
 function applyCodeBlockBorder(range) {
+  const backgroundColor = cssColorToWpsColor(CODE_BLOCK_BACKGROUND_COLOR);
   const borderColor = cssColorToWpsColor(CODE_BLOCK_BORDER_COLOR);
+
+  try {
+    range.Shading.BackgroundPatternColor = backgroundColor;
+  } catch {
+    // Some hosts may not expose paragraph shading.
+  }
 
   try {
     range.Borders.Enable = 1;
