@@ -1,0 +1,21 @@
+{
+  "openai": {
+    "baseUrl": "https://tokenflux.dev/v1",
+    "apiKeyEnv": "OPENAI_API_KEY"
+  },
+  "models": {
+    "chat": "gpt-5.4",
+    "image": "gpt-image-2"
+  },
+  "image": {
+    "size": "2048x1152",
+    "quality": "medium",
+    "outputFormat": "png",
+    "outputDir": "test-artifacts/novel-book/images"
+  },
+  "visualStyle": {
+    "series": "original modern fantasy novel illustration",
+    "palette": "rain-soaked night, cold cyan highlights, warm amber interiors, restrained cinematic contrast",
+    "characters": "consistent original characters only; no existing franchise characters, symbols, uniforms, or named locations"
+  }
+}

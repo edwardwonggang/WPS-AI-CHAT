@@ -39,11 +39,14 @@ const MAX_PENDING_CHARS = 160;
 const WPS_REFRESH_INTERVAL_MS = 80;
 const ALIGN_LEFT = 0;
 const ALIGN_CENTER = 1;
+const ALIGN_JUSTIFY = 3;
 const LINE_SPACING_EXACTLY = 4;
+const PAPER_SIZE_A4 = 7;
+const POINTS_PER_CM = 28.346456692913385;
 const HEADING_SIZES = {
   [HEADING_1]: 16,
-  [HEADING_2]: 15,
-  [HEADING_3]: 14,
+  [HEADING_2]: 14,
+  [HEADING_3]: 12,
   [HEADING_4]: 12,
   [HEADING_5]: 12,
   [HEADING_6]: 12
@@ -58,8 +61,8 @@ const HEADING_LEVELS = {
 };
 const HEADING_SIZE_BY_LEVEL = {
   1: 16,
-  2: 15,
-  3: 14,
+  2: 14,
+  3: 12,
   4: 12,
   5: 12,
   6: 12
@@ -77,9 +80,23 @@ const PAPER_TABLE_STYLE = Object.freeze({
 const PAPER_BODY_LINE_SPACING = 20;
 const PAPER_HEADING_LINE_SPACING = 22;
 const PAPER_TABLE_LINE_SPACING = 18;
-const PAPER_CODE_LINE_SPACING = 18;
+const PAPER_CODE_LINE_SPACING = 15;
 const PAPER_EQUATION_LINE_SPACING = 20;
 const PAPER_PARAGRAPH_INDENT_CHARS = 2;
+const PAPER_CODE_FONT_SIZE = 9.5;
+const CODE_HANGING_INDENT_CHARS = 4;
+const THESIS_PAGE_SETUP = Object.freeze({
+  bottomMarginCm: 2.54,
+  footerDistanceCm: 1.75,
+  headerDistanceCm: 1.5,
+  leftMarginCm: 3.17,
+  rightMarginCm: 3.17,
+  topMarginCm: 2.54
+});
+const UNNUMBERED_THESIS_HEADING_PATTERN =
+  /^(?:摘\s*要|abstract|目\s*录|目\s*次|参考文献|致\s*谢|附\s*录|原创性声明|学位论文原创性声明|使用授权|学位论文使用授权|作者简历|攻读.*期间.*成果)(?:\s|$|[:：])/i;
+const EXISTING_HEADING_NUMBER_PATTERN =
+  /^(?:第[一二三四五六七八九十百千万\d]+[章节篇]|[一二三四五六七八九十]+[、.．]|[0-9]+(?:\.[0-9]+)*\s+)/;
 const CODE_LINE_NUMBER_SEPARATOR = "   ";
 const CODE_LINE_NUMBER_MIN_WIDTH = 2;
 const CODE_LINE_NUMBER_COLOR = "#8c959f";
@@ -318,6 +335,26 @@ function activeCodeBlockContext(state) {
   );
 }
 
+function disableProofing(range) {
+  try {
+    range.NoProofing = 1;
+  } catch {
+    // Some hosts may not expose proofing controls.
+  }
+
+  try {
+    range.Font.NoProofing = 1;
+  } catch {
+    // Some hosts expose proofing through Font instead of Range.
+  }
+
+  try {
+    range.LanguageID = 1024;
+  } catch {
+    // Word-compatible hosts use 1024 for no-proofing; WPS may ignore it.
+  }
+}
+
 function applyTextStyle(range, style) {
   const font = range.Font;
 
@@ -331,6 +368,7 @@ function applyTextStyle(range, style) {
   if (style.code) {
     font.Name = "Consolas";
     font.NameAscii = "Consolas";
+    disableProofing(range);
   }
 
   if (style.color !== null && style.color !== undefined) {
@@ -427,6 +465,46 @@ function setParagraphNumeric(paragraph, key, value) {
   }
 }
 
+function cmToPoints(value) {
+  return Number(value) * POINTS_PER_CM;
+}
+
+function setObjectNumeric(target, key, value) {
+  try {
+    target[key] = value;
+  } catch {
+    // WPS and Word expose slightly different document/page setup surfaces.
+  }
+}
+
+function applyThesisDocumentSetup(doc) {
+  const pageSetup = doc?.PageSetup;
+  if (!pageSetup) {
+    return false;
+  }
+
+  setObjectNumeric(pageSetup, "PaperSize", PAPER_SIZE_A4);
+  setObjectNumeric(pageSetup, "Orientation", 0);
+  setObjectNumeric(pageSetup, "TopMargin", cmToPoints(THESIS_PAGE_SETUP.topMarginCm));
+  setObjectNumeric(pageSetup, "BottomMargin", cmToPoints(THESIS_PAGE_SETUP.bottomMarginCm));
+  setObjectNumeric(pageSetup, "LeftMargin", cmToPoints(THESIS_PAGE_SETUP.leftMarginCm));
+  setObjectNumeric(pageSetup, "RightMargin", cmToPoints(THESIS_PAGE_SETUP.rightMarginCm));
+  setObjectNumeric(pageSetup, "HeaderDistance", cmToPoints(THESIS_PAGE_SETUP.headerDistanceCm));
+  setObjectNumeric(pageSetup, "FooterDistance", cmToPoints(THESIS_PAGE_SETUP.footerDistanceCm));
+  setObjectNumeric(pageSetup, "Gutter", 0);
+  setObjectNumeric(pageSetup, "MirrorMargins", 0);
+
+  return true;
+}
+
+function applyThesisDocumentSetupOnce(state) {
+  if (state.thesisSetupApplied) {
+    return;
+  }
+
+  state.thesisSetupApplied = applyThesisDocumentSetup(state.doc);
+}
+
 function forEachParagraph(range, applyParagraph) {
   try {
     const paragraphs = range?.Paragraphs;
@@ -437,7 +515,7 @@ function forEachParagraph(range, applyParagraph) {
         const paragraphRange = paragraphs.Item(index)?.Range;
         const paragraph = paragraphRange?.ParagraphFormat;
         if (paragraphRange && paragraph) {
-          applyParagraph(paragraphRange, paragraph);
+          applyParagraph(paragraphRange, paragraph, paragraphs.Item(index));
         }
       }
       return;
@@ -557,6 +635,55 @@ function createHeadingMarker(state, level) {
   return `${state.headingCounters.slice(0, normalizedLevel).join(".")} `;
 }
 
+function normalizeHeadingTextForNumbering(text) {
+  return String(text ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseExistingHeadingNumber(text) {
+  const normalized = normalizeHeadingTextForNumbering(text);
+  const match = normalized.match(/^([0-9]+(?:\.[0-9]+)*)\s+/);
+  if (!match) {
+    return null;
+  }
+
+  const parts = match[1]
+    .split(".")
+    .map((value) => Number.parseInt(value, 10))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return parts.length > 0 ? parts : null;
+}
+
+function syncHeadingCounters(state, numbers) {
+  if (!Array.isArray(numbers) || numbers.length === 0) {
+    return;
+  }
+
+  for (let index = 0; index < state.headingCounters.length; index += 1) {
+    state.headingCounters[index] = numbers[index] || 0;
+  }
+}
+
+function createThesisHeadingMarker(state, level, upcomingText) {
+  const normalized = normalizeHeadingTextForNumbering(upcomingText);
+  if (UNNUMBERED_THESIS_HEADING_PATTERN.test(normalized)) {
+    return "";
+  }
+
+  const existingNumbers = parseExistingHeadingNumber(normalized);
+  if (existingNumbers) {
+    syncHeadingCounters(state, existingNumbers);
+    return "";
+  }
+
+  if (EXISTING_HEADING_NUMBER_PATTERN.test(normalized)) {
+    return "";
+  }
+
+  return createHeadingMarker(state, level);
+}
+
 function applyHeadingFormat(range, level) {
   const font = range.Font;
   setFontFamily(font, "SimHei", "Times New Roman");
@@ -566,7 +693,7 @@ function applyHeadingFormat(range, level) {
     font.Size = HEADING_SIZE_BY_LEVEL[level];
   }
 
-  forEachParagraph(range, (_paragraphRange, paragraph) => {
+  forEachParagraph(range, (_paragraphRange, paragraph, paragraphObject) => {
     setParagraphNumeric(paragraph, "Alignment", ALIGN_LEFT);
     setParagraphNumeric(paragraph, "CharacterUnitFirstLineIndent", 0);
     setParagraphNumeric(paragraph, "CharacterUnitLeftIndent", 0);
@@ -574,20 +701,27 @@ function applyHeadingFormat(range, level) {
     setParagraphNumeric(paragraph, "LineSpacing", PAPER_HEADING_LINE_SPACING);
     setParagraphNumeric(paragraph, "SpaceBefore", level === 1 ? 10 : 6);
     setParagraphNumeric(paragraph, "SpaceAfter", level === 1 ? 6 : 3);
+    setParagraphNumeric(paragraph, "OutlineLevel", level);
+    if (paragraphObject) {
+      setParagraphNumeric(paragraphObject, "OutlineLevel", level);
+    }
   });
 }
 
 function applyParagraphFormat(range, kind, depth = 0) {
   let leftIndent = 0;
   let firstLineIndent = 0;
+  let alignment = ALIGN_JUSTIFY;
 
   if (kind === "paragraph") {
     firstLineIndent = PAPER_PARAGRAPH_INDENT_CHARS;
   } else if (kind === "list") {
     leftIndent = Math.max(1, depth) * 2;
     firstLineIndent = -2;
+    alignment = ALIGN_LEFT;
   } else if (kind === "quote") {
     leftIndent = 2;
+    alignment = ALIGN_LEFT;
   }
 
   if (kind === "quote") {
@@ -599,7 +733,7 @@ function applyParagraphFormat(range, kind, depth = 0) {
   }
 
   forEachParagraph(range, (_paragraphRange, paragraph) => {
-    setParagraphNumeric(paragraph, "Alignment", ALIGN_LEFT);
+    setParagraphNumeric(paragraph, "Alignment", alignment);
     setParagraphNumeric(paragraph, "CharacterUnitLeftIndent", leftIndent);
     setParagraphNumeric(paragraph, "CharacterUnitFirstLineIndent", firstLineIndent);
     setParagraphNumeric(paragraph, "LineSpacingRule", LINE_SPACING_EXACTLY);
@@ -675,16 +809,34 @@ function applyTableFormat(table) {
 function applyCodeFormat(range) {
   const font = range.Font;
   setFontFamily(font, "Consolas", "Consolas");
-  font.Size = 10.5;
+  font.Size = PAPER_CODE_FONT_SIZE;
 
-  forEachParagraph(range, (_paragraphRange, paragraph) => {
+  try {
+    disableProofing(range);
+  } catch {
+    // Proofing controls are optional.
+  }
+
+  const backgroundColor = cssColorToWpsColor(CODE_BLOCK_BACKGROUND_COLOR);
+  forEachParagraph(range, (paragraphRange, paragraph) => {
+    disableProofing(paragraphRange);
+    try {
+      paragraphRange.Shading.BackgroundPatternColor = backgroundColor;
+    } catch {
+      // Some hosts may not expose paragraph shading.
+    }
+    try {
+      paragraph.Shading.BackgroundPatternColor = backgroundColor;
+    } catch {
+      // Some hosts may not expose paragraph-format shading.
+    }
     setParagraphNumeric(paragraph, "Alignment", ALIGN_LEFT);
-    setParagraphNumeric(paragraph, "CharacterUnitLeftIndent", 0);
-    setParagraphNumeric(paragraph, "CharacterUnitFirstLineIndent", 0);
+    setParagraphNumeric(paragraph, "CharacterUnitLeftIndent", CODE_HANGING_INDENT_CHARS);
+    setParagraphNumeric(paragraph, "CharacterUnitFirstLineIndent", -CODE_HANGING_INDENT_CHARS);
     setParagraphNumeric(paragraph, "LineSpacingRule", LINE_SPACING_EXACTLY);
     setParagraphNumeric(paragraph, "LineSpacing", PAPER_CODE_LINE_SPACING);
-    setParagraphNumeric(paragraph, "SpaceBefore", 6);
-    setParagraphNumeric(paragraph, "SpaceAfter", 6);
+    setParagraphNumeric(paragraph, "SpaceBefore", 0);
+    setParagraphNumeric(paragraph, "SpaceAfter", 0);
   });
 
   applyCodeBlockBorder(range);
@@ -751,7 +903,7 @@ function applyEquationFormat(range) {
 
 function applyBaseParagraphFormat(range) {
   forEachParagraph(range, (_paragraphRange, paragraph) => {
-    setParagraphNumeric(paragraph, "Alignment", ALIGN_LEFT);
+    setParagraphNumeric(paragraph, "Alignment", ALIGN_JUSTIFY);
     setParagraphNumeric(paragraph, "CharacterUnitLeftIndent", 0);
     setParagraphNumeric(paragraph, "CharacterUnitFirstLineIndent", PAPER_PARAGRAPH_INDENT_CHARS);
     setParagraphNumeric(paragraph, "LineSpacingRule", LINE_SPACING_EXACTLY);
@@ -1258,6 +1410,8 @@ function ensureWriteTarget(state) {
     return;
   }
 
+  applyThesisDocumentSetupOnce(state);
+
   if (state.replaceSelection && state.selectionEnd > state.selectionStart) {
     state.doc.Range(state.selectionStart, state.selectionEnd).Text = "";
   }
@@ -1435,7 +1589,7 @@ function currentTextStyle(state) {
   return style;
 }
 
-function consumeLinePrefix(state) {
+function consumeLinePrefix(state, upcomingText = "") {
   if (!state.lineStart || state.cancelled || state.disabled) {
     return;
   }
@@ -1460,6 +1614,13 @@ function consumeLinePrefix(state) {
   }
 
   if (heading?.headingPrefixPending) {
+    if (heading.headingMarker === undefined) {
+      heading.headingMarker = createThesisHeadingMarker(
+        state,
+        heading.headingLevel || HEADING_LEVELS[heading.type] || 1,
+        upcomingText
+      );
+    }
     prefix += heading.headingMarker || "";
     heading.headingPrefixPending = false;
   }
@@ -1597,7 +1758,7 @@ function appendText(state, text) {
     }
 
     if (textPart) {
-      consumeLinePrefix(state);
+      consumeLinePrefix(state, textPart);
       queueText(state, textPart, style);
     }
 
@@ -1654,7 +1815,7 @@ function pushToken(state, type) {
         ensureBreaks(state, 1);
       }
       if (HEADING_LEVELS[type]) {
-        context.headingMarker = createHeadingMarker(state, HEADING_LEVELS[type]);
+        context.headingLevel = HEADING_LEVELS[type];
         context.headingPrefixPending = true;
       }
       break;
@@ -1869,6 +2030,7 @@ export function createWpsMarkdownSink({ replaceSelection } = {}) {
     selectionStart,
     stack: [],
     startedWriting: false,
+    thesisSetupApplied: false,
     trailingBreaks: 0,
     writeStyle
   };

@@ -1,0 +1,31 @@
+Document: WpsAiUiTest-20260425-232518.docx
+Paragraphs: 46
+Tables: 1
+TablesOfContents: 0
+HeadingLikeParagraphs: 3
+OutlineHeadingParagraphs: 0
+TocParagraphs: 0
+CodeParagraphs: 12
+BodyParagraphsSampled: 26
+
+Headings:
+1: kind=numbered-heading; outline=10; style=正文; font=/Times New Roman; size=16; bold=-1; text=1 论文写作格式检查示例
+2: kind=numbered-heading; outline=10; style=正文; font=/Times New Roman; size=15; bold=-1; text=1.1 格式规范概览
+3: kind=numbered-heading; outline=10; style=正文; font=/Times New Roman; size=14; bold=-1; text=1.1.1 具体检查项
+
+TOC:
+
+
+Code:
+26: font=Consolas/Consolas; size=10.5; color=9999999; shading=16447734; text=1 // 检查段落行距是否符合标准
+27: font=Consolas/Consolas; size=10.5; color=9999999; shading=16447734; text=2 const STANDARD_LINE_SPACING = 22; // 标准行距（磅）
+28: font=Consolas/Consolas; size=10.5; color=10458508; shading=16447734; text=3
+29: font=Consolas/Consolas; size=10.5; color=9999999; shading=16447734; text=4 function checkLineSpacing(paragraphLineSpacing) {
+30: font=Consolas/Consolas; size=10.5; color=9999999; shading=16447734; text=5 // 允许±1磅的微小误差
+31: font=Consolas/Consolas; size=10.5; color=9999999; shading=16447734; text=6 const tolerance = 1;
+32: font=Consolas/Consolas; size=10.5; color=9999999; shading=16447734; text=7 if (Math.abs(paragraphLineSpacing - STANDARD_LINE_SPACING) <= tolerance) {
+33: font=Consolas/Consolas; size=10.5; color=9999999; shading=16447734; text=8 return true; // 符合标准
+34: font=Consolas/Consolas; size=10.5; color=9999999; shading=16447734; text=9 } else {
+35: font=Consolas/Consolas; size=10.5; color=9999999; shading=16447734; text=10 return false; // 不符合标准
+36: font=Consolas/Consolas; size=10.5; color=9999999; shading=16447734; text=11 }
+37: font=Consolas/Consolas; size=10.5; color=9999999; shading=16447734; text=12 }
