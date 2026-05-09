@@ -355,6 +355,45 @@ function Get-TableSummary {
   }
 }
 
+function Get-PageSetupSummary {
+  param($Document)
+
+  $pageSetup = $Document.PageSetup
+  $summary = [ordered]@{
+    paperSize = $null
+    topMargin = $null
+    bottomMargin = $null
+    leftMargin = $null
+    rightMargin = $null
+    headerDistance = $null
+    footerDistance = $null
+  }
+
+  try { $summary.paperSize = [int]$pageSetup.PaperSize } catch {}
+  try { $summary.topMargin = [double]$pageSetup.TopMargin } catch {}
+  try { $summary.bottomMargin = [double]$pageSetup.BottomMargin } catch {}
+  try { $summary.leftMargin = [double]$pageSetup.LeftMargin } catch {}
+  try { $summary.rightMargin = [double]$pageSetup.RightMargin } catch {}
+  try { $summary.headerDistance = [double]$pageSetup.HeaderDistance } catch {}
+  try { $summary.footerDistance = [double]$pageSetup.FooterDistance } catch {}
+
+  return [pscustomobject]$summary
+}
+
+function Test-NearPoints {
+  param(
+    $Actual,
+    [double]$Expected,
+    [double]$Tolerance = 2.0
+  )
+
+  if ($null -eq $Actual) {
+    return $false
+  }
+
+  return ([Math]::Abs(([double]$Actual) - $Expected) -le $Tolerance)
+}
+
 function Get-FormatStats {
   param($Document)
 
@@ -365,9 +404,17 @@ function Get-FormatStats {
     boldChars = 0
     italicChars = 0
     headingLikeParagraphs = 0
+    outlineHeadingParagraphs = 0
     quoteLikeParagraphs = 0
     codeLineNumberParagraphs = 0
+    codeHangingIndentParagraphs = 0
+    codeNoProofingChars = 0
     leftAlignedParagraphs = 0
+    bodyJustifiedParagraphs = 0
+    duplicateHeadingNumberParagraphs = 0
+    captionLikeParagraphs = 0
+    equationCenteredParagraphs = 0
+    listLikeParagraphs = 0
     paragraphSamples = @()
   }
 
@@ -386,6 +433,7 @@ function Get-FormatStats {
       $firstLineIndent = 0
       $fontName = ""
       $fontNameAscii = ""
+      $outlineLevel = 10
       try { $fontSize = [double]$range.Font.Size } catch {}
       try { $bold = [int]$range.Font.Bold } catch {}
       try { $alignment = [string]$range.ParagraphFormat.Alignment } catch {}
@@ -394,18 +442,48 @@ function Get-FormatStats {
       try { $firstLineIndent = [double]$range.ParagraphFormat.CharacterUnitFirstLineIndent } catch {}
       try { $fontName = [string]$range.Font.Name } catch {}
       try { $fontNameAscii = [string]$range.Font.NameAscii } catch {}
+      try { $outlineLevel = [int]$paragraph.OutlineLevel } catch {}
 
       if ($fontSize -ge 14 -or $bold -ne 0) {
         $stats.headingLikeParagraphs++
+      }
+      if ($outlineLevel -ge 1 -and $outlineLevel -le 6) {
+        $stats.outlineHeadingParagraphs++
+      }
+      if ($text -match "^(\d+(?:\.\d+)*)\.?\s+\1(?:\s|[.．、:：])") {
+        $stats.duplicateHeadingNumberParagraphs++
+      }
+      if ($text -match "^[\u56FE\u8868]\s*\d+" -and $fontNameAscii -notlike "*Consolas*") {
+        $stats.captionLikeParagraphs++
+      }
+      if ($text -match "E\s*=\s*mc" -and ($alignment -eq "1" -or $alignment -eq "wdAlignParagraphCenter")) {
+        $stats.equationCenteredParagraphs++
+      }
+      if (
+        ($text -match "^(?:\d+[.)]|[\u2022\u2611\u2610])\s+" -or $text -match "^[\u25CF\u25CB]\s+") -and
+        $fontNameAscii -notlike "*Consolas*"
+      ) {
+        $stats.listLikeParagraphs++
       }
       if ($leftIndent -ge 2 -and $firstLineIndent -ge 0 -and $fontNameAscii -notlike "*Consolas*") {
         $stats.quoteLikeParagraphs++
       }
       if ($text -match "^\d+\s+\S" -and ($fontName -like "*Consolas*" -or $fontNameAscii -like "*Consolas*")) {
         $stats.codeLineNumberParagraphs++
+        if ($leftIndent -ge 3 -and $firstLineIndent -le -3) {
+          $stats.codeHangingIndentParagraphs++
+        }
       }
       if ($alignment -eq "0" -or $alignment -eq "wdAlignParagraphLeft") {
         $stats.leftAlignedParagraphs++
+      }
+      if (
+        ($alignment -eq "3" -or $alignment -eq "wdAlignParagraphJustify") -and
+        $firstLineIndent -ge 2 -and
+        $outlineLevel -eq 10 -and
+        $fontNameAscii -notlike "*Consolas*"
+      ) {
+        $stats.bodyJustifiedParagraphs++
       }
 
       if ($stats.paragraphSamples.Count -lt 24) {
@@ -421,6 +499,7 @@ function Get-FormatStats {
           fontNameAscii = $fontNameAscii
           fontSize = $fontSize
           bold = $bold
+          outlineLevel = $outlineLevel
           alignment = $alignment
           lineSpacing = $lineSpacing
           leftIndent = $leftIndent
@@ -442,15 +521,20 @@ function Get-FormatStats {
       $color = $null
       $bold = 0
       $italic = 0
+      $noProofing = 0
 
       try { $fontName = [string]$charRange.Font.Name } catch {}
       try { $fontNameAscii = [string]$charRange.Font.NameAscii } catch {}
       try { $color = [int]$charRange.Font.Color } catch {}
       try { $bold = [int]$charRange.Font.Bold } catch {}
       try { $italic = [int]$charRange.Font.Italic } catch {}
+      try { $noProofing = [int]$charRange.NoProofing } catch {}
 
       if ($fontName -like "*Consolas*" -or $fontNameAscii -like "*Consolas*") {
         $stats.codeFontChars++
+        if ($noProofing -ne 0) {
+          $stats.codeNoProofingChars++
+        }
       }
       if ($null -ne $color -and $color -ne 0 -and $color -ne -16777216) {
         $stats.coloredChars++
@@ -659,6 +743,7 @@ while ((Get-Date) -lt $deadline) {
 
 $finalText = Get-DocumentText $wpsContext.doc
 $finalTables = Get-TableSummary $wpsContext.doc
+$pageSetup = Get-PageSetupSummary $wpsContext.doc
 
 if ($finalText.Length -le 30) {
   Save-Screenshot $wpsProcess $StuckShot
@@ -673,9 +758,19 @@ Save-Screenshot $wpsProcess $AfterShot
 
 $tableOk = $false
 if ($finalTables.count -ge 1) {
-  $firstTable = $finalTables.items | Select-Object -First 1
-  $tableOk = ($firstTable.rows -ge 4 -and $firstTable.cols -ge 3)
+  $matchingTable = $finalTables.items |
+    Where-Object { $_.rows -ge 4 -and $_.cols -ge 3 } |
+    Select-Object -First 1
+  $tableOk = $null -ne $matchingTable
 }
+
+$pageOk = (
+  $pageSetup.paperSize -eq 7 -and
+  (Test-NearPoints $pageSetup.topMargin 72.0) -and
+  (Test-NearPoints $pageSetup.bottomMargin 72.0) -and
+  (Test-NearPoints $pageSetup.leftMargin 89.9) -and
+  (Test-NearPoints $pageSetup.rightMargin 89.9)
+)
 
 $summary = [pscustomobject]@{
   runId = $RunId
@@ -685,14 +780,26 @@ $summary = [pscustomobject]@{
   chars = $finalText.Length
   tableCount = $finalTables.count
   tables = $finalTables.items
+  pageSetup = $pageSetup
   checks = [pscustomobject]@{
     bodyText = ($finalText.Length -gt 200)
-    headings = ($formatStats.headingLikeParagraphs -ge 2)
+    thesisPage = $pageOk
+    bodyParagraph = ($formatStats.bodyJustifiedParagraphs -ge 1)
+    headings = ($formatStats.headingLikeParagraphs -ge 2 -and $formatStats.outlineHeadingParagraphs -ge 2)
+    headingNumbering = ($formatStats.duplicateHeadingNumberParagraphs -eq 0)
+    thesisBreadth = (
+      $formatStats.outlineHeadingParagraphs -ge 5 -and
+      $formatStats.bodyJustifiedParagraphs -ge 4 -and
+      $formatStats.captionLikeParagraphs -ge 2 -and
+      $formatStats.equationCenteredParagraphs -ge 1 -and
+      $formatStats.listLikeParagraphs -ge 2
+    )
     quote = ($formatStats.quoteLikeParagraphs -ge 1)
     table = $tableOk
     codeFont = ($formatStats.codeFontChars -gt 0)
     codeColor = ($formatStats.coloredChars -gt 0)
     codeLineNumbers = ($formatStats.codeLineNumberParagraphs -ge 2)
+    codeHangingIndent = ($formatStats.codeHangingIndentParagraphs -ge 2)
     bold = ($formatStats.boldChars -gt 0)
     italic = ($formatStats.italicChars -gt 0)
   }
@@ -715,11 +822,20 @@ $summary = [pscustomobject]@{
 Add-Log ("SUMMARY={0}" -f $SummaryPath)
 Add-Log ("FINAL_CHARS={0}" -f $summary.chars)
 Add-Log ("FINAL_TABLES={0}" -f $summary.tableCount)
+Add-Log ("PAGE_SETUP paper={0} top={1:n2} bottom={2:n2} left={3:n2} right={4:n2}" -f $pageSetup.paperSize, $pageSetup.topMargin, $pageSetup.bottomMargin, $pageSetup.leftMargin, $pageSetup.rightMargin)
 Add-Log ("CODE_FONT_CHARS={0}" -f $formatStats.codeFontChars)
 Add-Log ("COLORED_CHARS={0}" -f $formatStats.coloredChars)
 Add-Log ("HEADING_LIKE_PARAGRAPHS={0}" -f $formatStats.headingLikeParagraphs)
+Add-Log ("OUTLINE_HEADING_PARAGRAPHS={0}" -f $formatStats.outlineHeadingParagraphs)
+Add-Log ("DUPLICATE_HEADING_NUMBER_PARAGRAPHS={0}" -f $formatStats.duplicateHeadingNumberParagraphs)
+Add-Log ("BODY_JUSTIFIED_PARAGRAPHS={0}" -f $formatStats.bodyJustifiedParagraphs)
+Add-Log ("CAPTION_LIKE_PARAGRAPHS={0}" -f $formatStats.captionLikeParagraphs)
+Add-Log ("EQUATION_CENTERED_PARAGRAPHS={0}" -f $formatStats.equationCenteredParagraphs)
+Add-Log ("LIST_LIKE_PARAGRAPHS={0}" -f $formatStats.listLikeParagraphs)
 Add-Log ("QUOTE_LIKE_PARAGRAPHS={0}" -f $formatStats.quoteLikeParagraphs)
 Add-Log ("CODE_LINE_NUMBER_PARAGRAPHS={0}" -f $formatStats.codeLineNumberParagraphs)
+Add-Log ("CODE_HANGING_INDENT_PARAGRAPHS={0}" -f $formatStats.codeHangingIndentParagraphs)
+Add-Log ("CODE_NO_PROOFING_CHARS={0}" -f $formatStats.codeNoProofingChars)
 
 $failedChecks = @()
 foreach ($property in $summary.checks.PSObject.Properties) {

@@ -11,4 +11,6 @@ WPS_TEST_LOG.md
 wps-*.png
 wps-*.log
 wpsjs-*.log
+server/novel.config.local.json
+test-artifacts/novel-book/
 wpsjs-debug.log

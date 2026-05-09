@@ -1,0 +1,65 @@
+{
+    "runId":  "20260426-181915",
+    "runDir":  "D:\\cursor_dev\\wps_ai\\.\\test-artifacts\\wps-ai-ui\\20260426-181915",
+    "log":  "D:\\cursor_dev\\wps_ai\\.\\test-artifacts\\wps-ai-ui\\20260426-181915\\run.log",
+    "document":  "WpsAiUiTest-20260426-181915.docx",
+    "chars":  2520,
+    "tableCount":  0,
+    "tables":  [
+
+               ],
+    "pageSetup":  {
+                      "paperSize":  7,
+                      "topMargin":  72,
+                      "bottomMargin":  72,
+                      "leftMargin":  89.8499984741211,
+                      "rightMargin":  89.8499984741211,
+                      "headerDistance":  42.5,
+                      "footerDistance":  49.599998474121094
+                  },
+    "checks":  {
+                   "bodyText":  true,
+                   "thesisPage":  true,
+                   "bodyParagraph":  false,
+                   "headings":  false,
+                   "headingNumbering":  true,
+                   "thesisBreadth":  false,
+                   "quote":  false,
+                   "table":  false,
+                   "codeFont":  true,
+                   "codeColor":  true,
+                   "codeLineNumbers":  false,
+                   "codeHangingIndent":  false,
+                   "bold":  true,
+                   "italic":  true
+               },
+    "formatStats":  {
+                        "sampledChars":  2520,
+                        "codeFontChars":  234,
+                        "coloredChars":  735,
+                        "boldChars":  83,
+                        "italicChars":  11,
+                        "headingLikeParagraphs":  1,
+                        "outlineHeadingParagraphs":  1,
+                        "quoteLikeParagraphs":  0,
+                        "codeLineNumberParagraphs":  0,
+                        "codeHangingIndentParagraphs":  0,
+                        "codeNoProofingChars":  0,
+                        "leftAlignedParagraphs":  0,
+                        "bodyJustifiedParagraphs":  0,
+                        "duplicateHeadingNumberParagraphs":  0,
+                        "captionLikeParagraphs":  0,
+                        "equationCenteredParagraphs":  0,
+                        "listLikeParagraphs":  0,
+                        "paragraphSamples":  [
+
+                                             ]
+                    },
+    "screenshots":  {
+                        "before":  "D:\\cursor_dev\\wps_ai\\.\\test-artifacts\\wps-ai-ui\\20260426-181915\\before-send.png",
+                        "promptFilled":  "D:\\cursor_dev\\wps_ai\\.\\test-artifacts\\wps-ai-ui\\20260426-181915\\prompt-filled-before-submit.png",
+                        "promptSubmitted":  "D:\\cursor_dev\\wps_ai\\.\\test-artifacts\\wps-ai-ui\\20260426-181915\\prompt-submitted.png",
+                        "after":  "D:\\cursor_dev\\wps_ai\\.\\test-artifacts\\wps-ai-ui\\20260426-181915\\after-output.png",
+                        "stuck":  "D:\\cursor_dev\\wps_ai\\.\\test-artifacts\\wps-ai-ui\\20260426-181915\\stuck.png"
+                    }
+}

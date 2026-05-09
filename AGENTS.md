@@ -40,3 +40,28 @@ If a command can reasonably run through `rtk`, it must run through `rtk`.
 Only bypass `rtk` when exact byte-for-byte output matters, the command is tiny and trivial, the command is interactive, or `rtk` would change command semantics.
 
 If an `rtk` command fails, diagnose and fix the `rtk` command usage first. Do not immediately fall back to the equivalent raw shell command.
+
+## Project Build Commands
+
+Do not use `rtk npm run build` in this project unless the user explicitly asks to test that exact package script.
+
+This package script combines Vite build, local WPS add-in installation, and relay startup. In Codex it can time out even after the build and install have already succeeded.
+
+For normal build/install verification in this project, use the known-good split sequence:
+
+```powershell
+rtk proxy npx vite build
+rtk powershell -NoProfile -ExecutionPolicy Bypass -File ".\server\install-local-addon.ps1"
+```
+
+After installing, verify the add-in target directly:
+
+```powershell
+rtk powershell -NoProfile -Command "`$target = Join-Path `$env:APPDATA 'kingsoft\wps\jsaddons\wps-ai_1.0.4'; Get-ChildItem -LiteralPath `$target -Recurse -File | Sort-Object LastWriteTime -Descending | Select-Object -First 8 FullName,LastWriteTime,Length"
+```
+
+For render-only validation, use:
+
+```powershell
+rtk npm run test:render-smoke
+```

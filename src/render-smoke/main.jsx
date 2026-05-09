@@ -30,6 +30,10 @@ function hasEffectiveTextStyle(output, text, predicate) {
   return fonts.length > 0 && fonts.every(predicate);
 }
 
+function countOccurrences(text, pattern) {
+  return String(text ?? "").split(pattern).length - 1;
+}
+
 const SAMPLES = [
   {
     id: "heading-paragraph",
@@ -50,16 +54,87 @@ const SAMPLES = [
         output.ranges.some(
           (record) =>
             record.paragraph.Alignment === 0 &&
+            record.paragraph.OutlineLevel === 1 &&
             Number(record.font.Size) === 16 &&
             record.font.Name === "SimHei"
         ) &&
         output.ranges.some(
           (record) =>
-            record.paragraph.Alignment === 0 &&
+            record.paragraph.Alignment === 3 &&
             record.paragraph.CharacterUnitFirstLineIndent === 2 &&
             record.paragraph.LineSpacing === 20 &&
             record.font.Name === "SimSun"
-        )
+        ) &&
+        output.pageSetup.PaperSize === 7 &&
+        Math.abs(output.pageSetup.LeftMargin - 89.8583) < 0.5
+      );
+    }
+  },
+  {
+    id: "thesis-structure",
+    label: "Thesis Structure",
+    markdown: [
+      "# 摘要",
+      "这是摘要正文，用于验证无编号标题不会推进章节计数。关键词：WPS；硕士论文；格式渲染。",
+      "# Abstract",
+      "This abstract paragraph verifies unnumbered English thesis headings.",
+      "# 1 绪论",
+      "这是绪论正文，包含 **加粗内容**、*斜体内容* 和 `inlineCode`，用于验证正文基础格式。",
+      "## 研究背景",
+      "这是研究背景正文，应该自动得到 1.1 编号。",
+      "### 1.1.1 已编号三级标题",
+      "这是已有编号标题下的正文。",
+      "### 研究问题",
+      "这是研究问题正文，应该自动得到 1.1.2 编号。",
+      [
+        "| 项目 | 标准 | 检查点 |",
+        "| --- | --- | --- |",
+        "| 页面 | A4 | 页边距 |",
+        "| 正文 | 小四宋体 | 首行缩进 |"
+      ].join("\n"),
+      [
+        "```js",
+        "const value = 1;",
+        "function check(input) {",
+        "  if (input) return value;",
+        "  return 0;",
+        "}",
+        "```"
+      ].join("\n"),
+      "$$E=mc^2$$",
+      "# 参考文献",
+      "[1] GB/T 7713.1-2025. 学位论文编写规则."
+    ].join("\n\n"),
+    verifyChat(root) {
+      return Boolean(root.querySelector("h1") && root.querySelector("table") && root.querySelector("pre code"));
+    },
+    verifyWps(output) {
+      const stream = output.stream;
+      return (
+        stream.includes("摘要") &&
+        !/(^|\r)1\s+摘要/.test(stream) &&
+        !/(^|\r)2\s+参考文献/.test(stream) &&
+        stream.includes("1 绪论") &&
+        countOccurrences(stream, "1 绪论") === 1 &&
+        stream.includes("1.1 研究背景") &&
+        !stream.includes("1.1 1.1 研究背景") &&
+        stream.includes("1.1.1 已编号三级标题") &&
+        !stream.includes("1.1.1 1.1.1 已编号三级标题") &&
+        stream.includes("1.1.2 研究问题") &&
+        output.ranges.some((record) => record.paragraph.OutlineLevel === 1) &&
+        output.ranges.some((record) => record.paragraph.OutlineLevel === 2) &&
+        output.ranges.some((record) => record.paragraph.OutlineLevel === 3) &&
+        output.ranges.some(
+          (record) =>
+            record.paragraph.Alignment === 3 &&
+            record.paragraph.CharacterUnitFirstLineIndent === 2 &&
+            record.font.Name === "SimSun"
+        ) &&
+        output.tables.length === 1 &&
+        output.tables[0].rows.length === 3 &&
+        output.tables[0].rows[0].cells.length === 3 &&
+        output.ranges.some((record) => record.font.Name === "Consolas") &&
+        output.pageSetup.PaperSize === 7
       );
     }
   },
@@ -253,6 +328,7 @@ class FakeDocument {
     this.stream = "";
     this.rangeRecords = [];
     this.tables = [];
+    this.PageSetup = createMutableState({});
     this.ActiveWindow = {
       Selection: {
         Range: null
@@ -386,6 +462,7 @@ function runWpsSample(markdown) {
 
   return {
     debugError,
+    pageSetup: { ...doc.PageSetup },
     ranges: doc.rangeRecords.map((record) => ({
       end: record.end,
       font: { ...record.font },

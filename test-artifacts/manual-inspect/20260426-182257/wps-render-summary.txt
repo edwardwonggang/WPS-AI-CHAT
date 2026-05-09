@@ -1,0 +1,41 @@
+Document: WpsAiUiTest-20260426-181915.docx
+Paragraphs: 41
+Tables: 0
+TablesOfContents: 0
+PageSetup: paper=7; top=72; bottom=72; left=89.8499984741211; right=89.8499984741211
+HeadingLikeParagraphs: 37
+OutlineHeadingParagraphs: 37
+TocParagraphs: 0
+CodeParagraphs: 0
+BodyParagraphsSampled: 4
+
+Headings:
+1: kind=outline-heading; outline=1; style=正文; font=黑体/Times New Roman; size=16; bold=-1; text=摘要
+3: kind=outline-heading; outline=1; style=正文; font=Times New Roman/Times New Roman; size=16; bold=-1; text=Abstract
+5: kind=outline-heading; outline=1; style=正文; font=/Times New Roman; size=16; bold=-1; text=1 绪论
+6: kind=outline-heading; outline=2; style=正文; font=/Times New Roman; size=14; bold=-1; text=1.1 研究背景
+8: kind=outline-heading; outline=3; style=正文; font=/Times New Roman; size=12; bold=-1; text=1.1.1 研究问题
+10: kind=outline-heading; outline=3; style=正文; font=/Times New Roman; size=12; bold=-1; text=1.1.2 研究意义
+11: kind=outline-heading; outline=3; style=正文; font=/Times New Roman; size=12; bold=0; text=通过构建标准化的硕士论文Markdown骨架进行渲染测试，可以量化评估WPS的格式兼容性。成功通过测试将增强用户对WPS处理学术文档的信心，失败则能精准定位渲染缺陷，为软件迭代提供明确目标。同时，该骨架本身可作为高校或期刊社的格式检查模板。
+12: kind=outline-heading; outline=1; style=正文; font=/Times New Roman; size=16; bold=-1; text=2 2 系统设计
+13: kind=outline-heading; outline=2; style=正文; font=/Times New Roman; size=14; bold=-1; text=2.1 渲染链路
+14: kind=outline-heading; outline=3; style=正文; font=/Times New Roman; size=12; bold=0; text=测试设计的渲染链路模拟了从Markdown源码输入到最终PDF/页面输出的全过程。关键节点包括：解析器处理标题层级与手写编号、布局引擎计算表格与图表浮动位置、字体引擎匹配学术字符（如公式符号）、以及输出生成器应用页面样式。测试用例需针对每个节点注入边界条件。
+15: kind=outline-heading; outline=3; style=正文; font=/; size=12; bold=9999999; text=This sentence contains bold text, italic text, and inlineCode. 在回归测试中，必须确保这些基础内联元素在复杂文档结构中不被意外破坏或样式丢失。例如，在表格单元格或图注中，加粗和斜体应保持原义，代码片段应使用等宽字体。
+16: kind=outline-heading; outline=3; style=正文; font=/Times New Roman; size=12; bold=0; text=正文章节的自动编号逻辑是测试重点。当遇到“## 研究背景”时，系统应生成“1.1”；而遇到“### 1.1.1 研究问题”时，应原样保留“1.1.1”并继续后续 numbering 为“1.1.2”。这种混合编号模式常见于用户自定义的详细章节，考验渲染器的灵活性。
+17: kind=outline-heading; outline=3; style=正文; font=/Times New Roman; size=12; bold=0; text=测试还需覆盖学术元素的精确渲染。例如，块级公式$$E=mc^2$$必须居中显示且公式编号（如有）格式正确。图题“图1 系统渲染流程示意”与表题“表1 论文格式检查项”的标签与序号必须与文档中的实际编号同步，且符合“图/表”后接序号的惯例。
+18: kind=outline-heading; outline=3; style=正文; font=/Times New Roman; size=12; bold=0; text=代码块的语法高亮和注释显示也是验证点。以下js代码块应正确着色，并保留注释：
+19: kind=outline-heading; outline=3; style=正文; font=Consolas/Consolas; size=9.5; bold=0; text=1 // 验证格式渲染的测试函数
+20: kind=outline-heading; outline=3; style=正文; font=Consolas/Consolas; size=9.5; bold=0; text=2 const standard = "GB/T 7713.1-2025";
+21: kind=outline-heading; outline=3; style=正文; font=Consolas/Consolas; size=9.5; bold=0; text=3 function checkRendering(element) {
+22: kind=outline-heading; outline=3; style=正文; font=Consolas/Consolas; size=9.5; bold=0; text=4 if (element.type === 'table' && element.rows >= 5) {
+23: kind=outline-heading; outline=3; style=正文; font=Consolas/Consolas; size=9.5; bold=0; text=5 return "PASS";
+24: kind=outline-heading; outline=3; style=正文; font=Consolas/Consolas; size=9.5; bold=0; text=6 }
+25: kind=outline-heading; outline=3; style=正文; font=Consolas/Consolas; size=9.5; bold=0; text=7 return "FAIL";
+26: kind=outline-heading; outline=3; style=正文; font=Consolas/Consolas; size=9.5; bold=0; text=8 }
+27: kind=outline-heading; outline=3; style=正文; font=宋体/Times New Roman; size=12; bold=0; text=引用块需严格遵循块引用语法，并以指定前缀开头：
+28: kind=outline-heading; outline=3; style=正文; font=/Times New Roman; size=12; bold=0; text=> 引用说明：本测试骨架的设计参考了《学位论文编写规则》中的格式条款。
+
+TOC:
+
+
+Code:
