@@ -1009,6 +1009,7 @@ async function handleChatCompletions(req, res, providerId) {
   let upstreamDataReceived = false;
   let finished = false;
   let activeCurl = null;
+  let nonStreamingFallbackUsed = false;
   const attempts = buildAttemptEnvs(preferredProxy);
 
   function fail(message) {
@@ -1020,6 +1021,99 @@ async function handleChatCompletions(req, res, providerId) {
     }
     sendSse(res, { error: { message } });
     res.end();
+  }
+
+  /**
+   * Some corporate proxies (observed with ZTE) break streaming POST responses
+   * and replace the body with a plain "Internal Server Error" page. Detect
+   * these signals and fall back to a non-streaming request: curl buffers the
+   * full JSON response, we parse it, and emit a single SSE event to the
+   * client so the existing front-end path works unchanged.
+   */
+  function shouldTryNonStreamingFallback(detail) {
+    if (nonStreamingFallbackUsed) return false;
+    const normalized = String(detail || "").toLowerCase();
+    return (
+      normalized.includes("internal server error") ||
+      normalized.includes("bad gateway") ||
+      normalized.includes("proxy error") ||
+      /<html/i.test(detail || "") ||
+      /^\s*<\?xml/i.test(detail || "")
+    );
+  }
+
+  async function runNonStreamingFallback(previousErrorDetail) {
+    nonStreamingFallbackUsed = true;
+    relayLog("chat", "Falling back to non-streaming upstream request.", {
+      provider: providerId,
+      model: String(payloadBody?.model || ""),
+      previousErrorDetail: String(previousErrorDetail || "").slice(0, 200)
+    });
+
+    const bufferedPayload = { ...payloadBody, stream: false };
+
+    try {
+      const raw = await runCurlBuffered({
+        authorization,
+        url: upstreamUrl,
+        method: "POST",
+        headers: ["Content-Type: application/json", ...extraHeaders],
+        body: JSON.stringify(bufferedPayload),
+        preferredProxy
+      });
+
+      let json;
+      try {
+        json = JSON.parse(raw);
+      } catch {
+        fail(
+          `Non-streaming fallback received a non-JSON response: ${String(raw).slice(0, 200)}`
+        );
+        return;
+      }
+
+      if (json?.error) {
+        fail(parseUpstreamErrorBody(raw) || "Upstream returned an error.");
+        return;
+      }
+
+      // Wrap the single JSON response as one SSE chunk + [DONE] so the
+      // existing stream consumer in the front-end works unchanged.
+      if (!res.headersSent) {
+        setCorsHeaders(res, req);
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache, no-transform",
+          Connection: "keep-alive",
+          "X-Accel-Buffering": "no",
+          "X-Wps-Ai-Fallback": "non-stream"
+        });
+        res.write(": stream-open (fallback)\n\n");
+      }
+
+      const message = json?.choices?.[0]?.message || {};
+      const content = normalizeContent(message.content);
+      const ssePayload = {
+        id: json?.id || `fallback-${Date.now()}`,
+        object: "chat.completion.chunk",
+        created: json?.created || Math.floor(Date.now() / 1000),
+        model: json?.model || payloadBody?.model || "",
+        choices: [
+          {
+            index: 0,
+            delta: { role: "assistant", content },
+            finish_reason: json?.choices?.[0]?.finish_reason || "stop"
+          }
+        ]
+      };
+
+      res.write(`data: ${JSON.stringify(ssePayload)}\n\n`);
+      res.write("data: [DONE]\n\n");
+      finished = true;
+      res.end();
+    } catch (error) {
+      fail(error instanceof Error ? error.message : "Non-streaming fallback failed.");
+    }
   }
 
   function startAttempt(index) {
@@ -1074,7 +1168,19 @@ async function handleChatCompletions(req, res, providerId) {
 
         if (looksLikeSse) {
           upstreamDataReceived = true;
-          if (!streamStarted) streamStarted = true;
+          if (!streamStarted) {
+            streamStarted = true;
+            // Start the SSE response to the client now that we know upstream
+            // is actually speaking SSE.
+            setCorsHeaders(res, req);
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream; charset=utf-8",
+              "Cache-Control": "no-cache, no-transform",
+              Connection: "keep-alive",
+              "X-Accel-Buffering": "no"
+            });
+            res.write(": stream-open\n\n");
+          }
           res.write(upstreamBuffer);
           upstreamBuffer = "";
           return;
@@ -1084,7 +1190,6 @@ async function handleChatCompletions(req, res, providerId) {
         return;
       }
 
-      if (!streamStarted) streamStarted = true;
       res.write(text);
     });
 
@@ -1093,9 +1198,11 @@ async function handleChatCompletions(req, res, providerId) {
       attemptCompleted = true;
 
       if (detectedNonSse) {
+        const rawBody = upstreamBuffer;
         const upstreamMessage =
-          parseUpstreamErrorBody(upstreamBuffer) ||
+          parseUpstreamErrorBody(rawBody) ||
           formatCurlFailure(stderr || "Upstream returned an unexpected response.");
+
         if (
           attempt.label === "proxy" &&
           index + 1 < attempts.length &&
@@ -1104,6 +1211,13 @@ async function handleChatCompletions(req, res, providerId) {
           startAttempt(index + 1);
           return;
         }
+
+        // Proxy-stripped streaming response: try one buffered request.
+        if (shouldTryNonStreamingFallback(rawBody || upstreamMessage)) {
+          void runNonStreamingFallback(rawBody || upstreamMessage);
+          return;
+        }
+
         fail(upstreamMessage);
         return;
       }
@@ -1123,6 +1237,12 @@ async function handleChatCompletions(req, res, providerId) {
           startAttempt(index + 1);
           return;
         }
+
+        if (shouldTryNonStreamingFallback(message)) {
+          void runNonStreamingFallback(message);
+          return;
+        }
+
         fail(message);
         return;
       }
@@ -1143,6 +1263,10 @@ async function handleChatCompletions(req, res, providerId) {
           startAttempt(index + 1);
           return;
         }
+        if (shouldTryNonStreamingFallback(message)) {
+          void runNonStreamingFallback(message);
+          return;
+        }
         fail(message);
         return;
       }
@@ -1157,16 +1281,8 @@ async function handleChatCompletions(req, res, providerId) {
     if (!finished) activeCurl?.kill();
   });
 
-  setCorsHeaders(res, req);
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache, no-transform",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no"
-  });
-  res.write(": stream-open\n\n");
-  streamStarted = true;
-
+  // Don't write response headers yet — if we need to fall back to the
+  // non-streaming path we want to reuse the same res object.
   startAttempt(0);
 }
 
