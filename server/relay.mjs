@@ -99,14 +99,34 @@ function resolveConfigProxy(config) {
 function resolveWindowsProxy() {
   if (process.platform !== "win32") return "";
   try {
+    const settingsPath =
+      "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+
+    // Only honor the IE/system proxy if it is actually enabled.
+    try {
+      const enableOutput = execFileSync(
+        "reg.exe",
+        ["query", settingsPath, "/v", "ProxyEnable"],
+        {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+          windowsHide: true
+        }
+      );
+      const enableMatch = enableOutput.match(
+        /ProxyEnable\s+REG_\w+\s+0x([0-9a-f]+)/i
+      );
+      if (!enableMatch || parseInt(enableMatch[1], 16) === 0) {
+        return "";
+      }
+    } catch {
+      // Treat missing ProxyEnable as disabled.
+      return "";
+    }
+
     const output = execFileSync(
       "reg.exe",
-      [
-        "query",
-        "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
-        "/v",
-        "ProxyServer"
-      ],
+      ["query", settingsPath, "/v", "ProxyServer"],
       {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
@@ -530,11 +550,16 @@ function createCurlArgs({
   method = "GET",
   headers = [],
   dataFromStdin = false,
-  stream = false
+  stream = false,
+  includeStatus = false
 }) {
   const args = ["-sS"];
   if (stream) args.push("-N");
-  args.push("-f", "-X", method);
+  // -w writes the status code to stdout only if requested (not in streaming mode).
+  if (includeStatus && !stream) {
+    args.push("-o", "-", "-w", "\n__HTTP_STATUS__:%{http_code}");
+  }
+  args.push("-X", method);
   if (authorization) args.push("-H", `Authorization: ${authorization}`);
   for (const header of headers) {
     args.push("-H", header);
@@ -580,7 +605,8 @@ function runCurlBuffered({
           url,
           method,
           headers,
-          dataFromStdin: method !== "GET"
+          dataFromStdin: method !== "GET",
+          includeStatus: true
         }),
         {
           env: attempt.env,
@@ -605,25 +631,53 @@ function runCurlBuffered({
       });
 
       curl.on("close", (code) => {
-        if (code === 0) {
-          resolvePromise(stdout);
+        if (code !== 0) {
+          const message = formatCurlFailure(stderr || stdout);
+          if (
+            attempt.label === "proxy" &&
+            index + 1 < attempts.length &&
+            isProxyConnectionFailure(message)
+          ) {
+            relayLog("proxy", "Proxy attempt failed, retrying direct.", { url, message });
+            resolvePromise(runAttempt(index + 1));
+            return;
+          }
+          reject(new Error(message));
           return;
         }
 
-        const message = formatCurlFailure(stderr || stdout);
+        // Extract HTTP status we appended via `-w`.
+        const statusMatch = stdout.match(/\n__HTTP_STATUS__:(\d+)\s*$/);
+        const httpStatus = statusMatch ? Number(statusMatch[1]) : 0;
+        const responseBody = statusMatch
+          ? stdout.slice(0, statusMatch.index)
+          : stdout;
+
+        if (httpStatus >= 200 && httpStatus < 300) {
+          resolvePromise(responseBody);
+          return;
+        }
+
+        // Non-2xx from upstream: surface the body as the error message.
+        const upstreamMessage =
+          parseUpstreamErrorBody(responseBody) ||
+          `Upstream responded with HTTP ${httpStatus || "unknown"}.`;
+
         if (
           attempt.label === "proxy" &&
           index + 1 < attempts.length &&
-          isProxyConnectionFailure(message)
+          httpStatus >= 500
         ) {
-          relayLog("proxy", "Proxy attempt failed, retrying direct.", {
+          relayLog("proxy", "Proxy returned 5xx, retrying direct.", {
             url,
-            message
+            status: httpStatus,
+            message: upstreamMessage
           });
           resolvePromise(runAttempt(index + 1));
           return;
         }
-        reject(new Error(message));
+
+        reject(new Error(`HTTP ${httpStatus}: ${upstreamMessage}`));
       });
 
       if (method === "GET") {
@@ -635,6 +689,22 @@ function runCurlBuffered({
   }
 
   return runAttempt(0);
+}
+
+function parseUpstreamErrorBody(body) {
+  const trimmed = String(body || "").trim();
+  if (!trimmed) return "";
+  try {
+    const json = JSON.parse(trimmed);
+    return (
+      json?.error?.message ||
+      json?.error?.code ||
+      json?.message ||
+      JSON.stringify(json).slice(0, 400)
+    );
+  } catch {
+    return trimmed.slice(0, 400);
+  }
 }
 
 async function listProviderModels({
@@ -945,6 +1015,8 @@ async function handleChatCompletions(req, res, providerId) {
     const attempt = attempts[index];
     let stderr = "";
     let attemptCompleted = false;
+    let upstreamBuffer = "";
+    let detectedNonSse = false;
 
     activeCurl = spawn(
       CURL_BIN,
@@ -973,14 +1045,58 @@ async function handleChatCompletions(req, res, providerId) {
 
     activeCurl.stdout.on("data", (chunk) => {
       if (finished) return;
+      const text = chunk.toString("utf8");
+
+      // Look at the very first bytes: if they don't look like SSE (`data:` or
+      // a colon comment), treat it as a non-streaming error body from the
+      // upstream (e.g. OpenRouter returning a JSON 401/500) and surface it
+      // cleanly instead of forwarding garbage to the client.
+      if (!upstreamDataReceived) {
+        upstreamBuffer += text;
+        const preview = upstreamBuffer.trimStart();
+        if (!preview) return;
+
+        const looksLikeSse =
+          preview.startsWith("data:") ||
+          preview.startsWith(":") ||
+          preview.startsWith("event:");
+
+        if (looksLikeSse) {
+          upstreamDataReceived = true;
+          if (!streamStarted) streamStarted = true;
+          res.write(upstreamBuffer);
+          upstreamBuffer = "";
+          return;
+        }
+
+        detectedNonSse = true;
+        return;
+      }
+
       if (!streamStarted) streamStarted = true;
-      upstreamDataReceived = true;
-      res.write(chunk);
+      res.write(text);
     });
 
     activeCurl.stdout.on("end", () => {
       if (finished || attemptCompleted) return;
       attemptCompleted = true;
+
+      if (detectedNonSse) {
+        const upstreamMessage =
+          parseUpstreamErrorBody(upstreamBuffer) ||
+          formatCurlFailure(stderr || "Upstream returned an unexpected response.");
+        if (
+          attempt.label === "proxy" &&
+          index + 1 < attempts.length &&
+          isProxyConnectionFailure(upstreamMessage)
+        ) {
+          startAttempt(index + 1);
+          return;
+        }
+        fail(upstreamMessage);
+        return;
+      }
+
       if (!upstreamDataReceived) {
         const message = formatCurlFailure(stderr || "Upstream closed with no output.");
         if (
@@ -1393,8 +1509,94 @@ function handleTestCommandStatus(res, requestUrl) {
 }
 
 // ============================================================================
-// Server
+// Diagnose handler
 // ============================================================================
+
+async function handleDiagnose(req, res) {
+  let body = {};
+  try {
+    const contentType = String(req.headers["content-type"] || "").toLowerCase();
+    body = contentType.includes("application/x-www-form-urlencoded")
+      ? await readFormBody(req)
+      : await readJsonBody(req);
+  } catch {
+    sendJson(res, 400, { error: { message: "Invalid body" } });
+    return;
+  }
+
+  const providerId =
+    body.provider === "openrouter" ? "openrouter" : "nvidia";
+  const authorization = resolveRelayAuthorization(req, body);
+  const baseUrl = resolveUpstreamBaseUrl(req, providerId, body);
+  const preferredProxy = resolveUpstreamProxy(req, body);
+  const extraHeaders = buildProviderExtraHeaders(providerId, req, body);
+
+  const result = {
+    platform: process.platform,
+    systemProxy: SYSTEM_PROXY || "",
+    providerId,
+    baseUrl,
+    usingProxy: preferredProxy || "",
+    curlVersion: "",
+    steps: []
+  };
+
+  try {
+    const version = execFileSync(CURL_BIN, ["--version"], {
+      encoding: "utf8",
+      windowsHide: true
+    });
+    result.curlVersion = version.split("\n")[0];
+  } catch (error) {
+    result.curlVersion = `unavailable: ${error instanceof Error ? error.message : String(error)}`;
+  }
+
+  async function probe(label, fn) {
+    const startedAt = Date.now();
+    try {
+      const detail = await fn();
+      result.steps.push({
+        label,
+        ok: true,
+        durationMs: Date.now() - startedAt,
+        detail
+      });
+    } catch (error) {
+      result.steps.push({
+        label,
+        ok: false,
+        durationMs: Date.now() - startedAt,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  // Probe 1: reachability of the base URL with no auth (to rule out network).
+  await probe(`GET ${baseUrl}/models (auth + proxy)`, async () => {
+    if (!authorization) {
+      throw new Error("Missing API key — diagnose skipped.");
+    }
+    const raw = await runCurlBuffered({
+      authorization,
+      url: `${baseUrl.replace(/\/+$/, "")}/models`,
+      method: "GET",
+      headers: ["Accept: application/json", ...extraHeaders],
+      preferredProxy
+    });
+    try {
+      const json = JSON.parse(raw);
+      return {
+        modelCount: Array.isArray(json?.data) ? json.data.length : 0
+      };
+    } catch {
+      return { bodyPreview: String(raw).slice(0, 200) };
+    }
+  });
+
+  sendJson(res, 200, result);
+}
+
+
 
 const server = createServer(async (req, res) => {
   if (!req.url) {
@@ -1426,6 +1628,11 @@ const server = createServer(async (req, res) => {
 
   if (req.method === "GET" && pathname === "/bootstrap") {
     sendJson(res, 200, { ok: true, settings: BOOTSTRAP_SETTINGS });
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/diagnose") {
+    await handleDiagnose(req, res);
     return;
   }
 
