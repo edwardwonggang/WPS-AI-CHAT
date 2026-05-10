@@ -387,6 +387,7 @@ const RELAY_CONFIG = readRelayConfig();
 const SYSTEM_PROXY = resolveSystemProxy(RELAY_CONFIG);
 const BOOTSTRAP_SETTINGS = normalizeBootstrapSettings(RELAY_CONFIG);
 const SESSION_ROOT = normalizeSessionRoot(RELAY_CONFIG);
+const RELAY_LOG_BUFFER = [];
 
 function setCorsHeaders(res, req = null) {
   const origin = req?.headers?.origin;
@@ -426,6 +427,71 @@ function relayLog(scope, message, details = undefined) {
       ? ` ${JSON.stringify(details)}`
       : "";
   console.log(`[relay] [${scope}] ${message}${suffix}`);
+
+  const entry = {
+    time: new Date().toISOString(),
+    level: "info",
+    scope,
+    message,
+    details: details && typeof details === "object" ? details : {}
+  };
+  RELAY_LOG_BUFFER.push(entry);
+  if (RELAY_LOG_BUFFER.length > 500) RELAY_LOG_BUFFER.shift();
+  return entry;
+}
+
+function relayLogError(scope, message, details = undefined) {
+  const suffix =
+    details && typeof details === "object" && Object.keys(details).length > 0
+      ? ` ${JSON.stringify(details)}`
+      : "";
+  console.error(`[relay] [${scope}] [error] ${message}${suffix}`);
+
+  const entry = {
+    time: new Date().toISOString(),
+    level: "error",
+    scope,
+    message,
+    details: details && typeof details === "object" ? details : {}
+  };
+  RELAY_LOG_BUFFER.push(entry);
+  if (RELAY_LOG_BUFFER.length > 500) RELAY_LOG_BUFFER.shift();
+  return entry;
+}
+
+function sanitizeAuthHeader(value) {
+  if (!value) return "";
+  const text = String(value);
+  if (text.length <= 12) return "***";
+  return `${text.slice(0, 10)}...${text.slice(-4)} (len=${text.length})`;
+}
+
+function sanitizePayloadForLog(payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  const copy = { ...payload };
+  if (Array.isArray(copy.messages)) {
+    copy.messages = copy.messages.map((msg) => ({
+      role: msg?.role || "",
+      contentPreview: String(msg?.content ?? "").slice(0, 120),
+      contentLength: String(msg?.content ?? "").length
+    }));
+  }
+  return copy;
+}
+
+/**
+ * Write a `data: {type:"relay_debug",...}` event into the SSE response so the
+ * front-end can merge relay-side events into its own Debug Logs view. The
+ * front-end recognizes `type === "relay_debug"` and routes these to the log
+ * buffer instead of the chat stream.
+ */
+function emitSseDebug(res, entry) {
+  if (!res || res.writableEnded) return;
+  try {
+    res.write(`data: ${JSON.stringify({ type: "relay_debug", ...entry })}\n\n`);
+  } catch {
+    // Best-effort.
+  }
 }
 
 async function readJsonBody(req) {
@@ -969,7 +1035,8 @@ async function handleListModels(req, res, providerId) {
 async function handleChatCompletions(req, res, providerId) {
   relayLog("chat", "Incoming chat request.", {
     provider: providerId,
-    contentType: String(req.headers["content-type"] || "")
+    contentType: String(req.headers["content-type"] || ""),
+    userAgent: String(req.headers["user-agent"] || "").slice(0, 120)
   });
 
   let body;
@@ -1005,7 +1072,41 @@ async function handleChatCompletions(req, res, providerId) {
 
   const upstreamUrl = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
 
-  let streamStarted = false;
+  // Open the SSE response immediately so we can funnel relay_debug events to
+  // the front-end in real time. The actual upstream data is detected later
+  // and forwarded on top of the already-open stream.
+  setCorsHeaders(res, req);
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no"
+  });
+  res.write(": stream-open\n\n");
+
+  function debug(scope, message, details) {
+    const entry = relayLog(scope, message, details);
+    emitSseDebug(res, entry);
+  }
+
+  function debugError(scope, message, details) {
+    const entry = relayLogError(scope, message, details);
+    emitSseDebug(res, entry);
+  }
+
+  debug("chat", "Resolved upstream target.", {
+    provider: providerId,
+    upstreamUrl,
+    model: String(payloadBody?.model || ""),
+    stream: payloadBody?.stream !== false,
+    preferredProxy: preferredProxy || "(direct)",
+    systemProxy: SYSTEM_PROXY || "",
+    authHeader: sanitizeAuthHeader(authorization),
+    extraHeaderCount: extraHeaders.length,
+    payloadPreview: sanitizePayloadForLog(payloadBody)
+  });
+
+  let streamStarted = true;
   let upstreamDataReceived = false;
   let finished = false;
   let activeCurl = null;
@@ -1015,21 +1116,11 @@ async function handleChatCompletions(req, res, providerId) {
   function fail(message) {
     if (finished) return;
     finished = true;
-    if (!res.headersSent) {
-      sendJson(res, 502, { error: { message } });
-      return;
-    }
+    debugError("chat", "Final failure returned to client.", { message });
     sendSse(res, { error: { message } });
     res.end();
   }
 
-  /**
-   * Some corporate proxies (observed with ZTE) break streaming POST responses
-   * and replace the body with a plain "Internal Server Error" page. Detect
-   * these signals and fall back to a non-streaming request: curl buffers the
-   * full JSON response, we parse it, and emit a single SSE event to the
-   * client so the existing front-end path works unchanged.
-   */
   function shouldTryNonStreamingFallback(detail) {
     if (nonStreamingFallbackUsed) return false;
     const normalized = String(detail || "").toLowerCase();
@@ -1044,10 +1135,10 @@ async function handleChatCompletions(req, res, providerId) {
 
   async function runNonStreamingFallback(previousErrorDetail) {
     nonStreamingFallbackUsed = true;
-    relayLog("chat", "Falling back to non-streaming upstream request.", {
+    debug("chat", "Falling back to non-streaming upstream request.", {
       provider: providerId,
       model: String(payloadBody?.model || ""),
-      previousErrorDetail: String(previousErrorDetail || "").slice(0, 200)
+      previousErrorPreview: String(previousErrorDetail || "").slice(0, 300)
     });
 
     const bufferedPayload = { ...payloadBody, stream: false };
@@ -1060,6 +1151,11 @@ async function handleChatCompletions(req, res, providerId) {
         headers: ["Content-Type: application/json", ...extraHeaders],
         body: JSON.stringify(bufferedPayload),
         preferredProxy
+      });
+
+      debug("chat", "Non-streaming upstream response received.", {
+        bytes: raw.length,
+        preview: raw.slice(0, 200)
       });
 
       let json;
@@ -1075,20 +1171,6 @@ async function handleChatCompletions(req, res, providerId) {
       if (json?.error) {
         fail(parseUpstreamErrorBody(raw) || "Upstream returned an error.");
         return;
-      }
-
-      // Wrap the single JSON response as one SSE chunk + [DONE] so the
-      // existing stream consumer in the front-end works unchanged.
-      if (!res.headersSent) {
-        setCorsHeaders(res, req);
-        res.writeHead(200, {
-          "Content-Type": "text/event-stream; charset=utf-8",
-          "Cache-Control": "no-cache, no-transform",
-          Connection: "keep-alive",
-          "X-Accel-Buffering": "no",
-          "X-Wps-Ai-Fallback": "non-stream"
-        });
-        res.write(": stream-open (fallback)\n\n");
       }
 
       const message = json?.choices?.[0]?.message || {};
@@ -1122,6 +1204,14 @@ async function handleChatCompletions(req, res, providerId) {
     let attemptCompleted = false;
     let upstreamBuffer = "";
     let detectedNonSse = false;
+    const attemptStartedAt = Date.now();
+
+    debug("chat", "Starting upstream curl attempt.", {
+      attemptIndex: index,
+      attemptLabel: attempt.label,
+      proxy: attempt.env.HTTPS_PROXY || "(direct)",
+      model: String(payloadBody?.model || "")
+    });
 
     activeCurl = spawn(
       CURL_BIN,
@@ -1141,6 +1231,9 @@ async function handleChatCompletions(req, res, providerId) {
     );
 
     activeCurl.on("error", (error) => {
+      debugError("chat", "curl process spawn error.", {
+        error: error instanceof Error ? error.message : String(error)
+      });
       fail(error instanceof Error ? error.message : "Failed to start curl");
     });
 
@@ -1152,10 +1245,6 @@ async function handleChatCompletions(req, res, providerId) {
       if (finished) return;
       const text = chunk.toString("utf8");
 
-      // Look at the very first bytes: if they don't look like SSE (`data:` or
-      // a colon comment), treat it as a non-streaming error body from the
-      // upstream (e.g. OpenRouter returning a JSON 401/500) and surface it
-      // cleanly instead of forwarding garbage to the client.
       if (!upstreamDataReceived) {
         upstreamBuffer += text;
         const preview = upstreamBuffer.trimStart();
@@ -1168,19 +1257,10 @@ async function handleChatCompletions(req, res, providerId) {
 
         if (looksLikeSse) {
           upstreamDataReceived = true;
-          if (!streamStarted) {
-            streamStarted = true;
-            // Start the SSE response to the client now that we know upstream
-            // is actually speaking SSE.
-            setCorsHeaders(res, req);
-            res.writeHead(200, {
-              "Content-Type": "text/event-stream; charset=utf-8",
-              "Cache-Control": "no-cache, no-transform",
-              Connection: "keep-alive",
-              "X-Accel-Buffering": "no"
-            });
-            res.write(": stream-open\n\n");
-          }
+          debug("chat", "Upstream first bytes look like SSE, forwarding.", {
+            firstBytesPreview: upstreamBuffer.slice(0, 120),
+            attemptMs: Date.now() - attemptStartedAt
+          });
           res.write(upstreamBuffer);
           upstreamBuffer = "";
           return;
@@ -1203,16 +1283,25 @@ async function handleChatCompletions(req, res, providerId) {
           parseUpstreamErrorBody(rawBody) ||
           formatCurlFailure(stderr || "Upstream returned an unexpected response.");
 
+        debugError("chat", "Upstream returned non-SSE body.", {
+          attemptLabel: attempt.label,
+          bytes: rawBody.length,
+          durationMs: Date.now() - attemptStartedAt,
+          rawPreview: rawBody.slice(0, 400),
+          stderrPreview: stderr.slice(0, 300),
+          upstreamMessage
+        });
+
         if (
           attempt.label === "proxy" &&
           index + 1 < attempts.length &&
           isProxyConnectionFailure(upstreamMessage)
         ) {
+          debug("chat", "Proxy attempt failed, retrying direct.");
           startAttempt(index + 1);
           return;
         }
 
-        // Proxy-stripped streaming response: try one buffered request.
         if (shouldTryNonStreamingFallback(rawBody || upstreamMessage)) {
           void runNonStreamingFallback(rawBody || upstreamMessage);
           return;
@@ -1224,16 +1313,18 @@ async function handleChatCompletions(req, res, providerId) {
 
       if (!upstreamDataReceived) {
         const message = formatCurlFailure(stderr || "Upstream closed with no output.");
+        debugError("chat", "Upstream closed without data.", {
+          attemptLabel: attempt.label,
+          stderrPreview: stderr.slice(0, 300),
+          durationMs: Date.now() - attemptStartedAt,
+          message
+        });
+
         if (
           attempt.label === "proxy" &&
           index + 1 < attempts.length &&
           isProxyConnectionFailure(message)
         ) {
-          relayLog("proxy", "Proxy attempt failed during streaming, retrying direct.", {
-            provider: providerId,
-            model: String(payloadBody?.model || ""),
-            message
-          });
           startAttempt(index + 1);
           return;
         }
@@ -1246,6 +1337,10 @@ async function handleChatCompletions(req, res, providerId) {
         fail(message);
         return;
       }
+
+      debug("chat", "Upstream stream completed normally.", {
+        durationMs: Date.now() - attemptStartedAt
+      });
       finished = true;
       res.end();
     });
@@ -1254,7 +1349,17 @@ async function handleChatCompletions(req, res, providerId) {
       if (finished || attemptCompleted) return;
       attemptCompleted = true;
       if (!upstreamDataReceived) {
-        const message = formatCurlFailure(stderr || `curl exited with code ${code ?? "unknown"}`);
+        const message = formatCurlFailure(
+          stderr || `curl exited with code ${code ?? "unknown"}`
+        );
+        debugError("chat", "curl exited without upstream data.", {
+          attemptLabel: attempt.label,
+          exitCode: code,
+          stderrPreview: stderr.slice(0, 300),
+          durationMs: Date.now() - attemptStartedAt,
+          message
+        });
+
         if (
           attempt.label === "proxy" &&
           index + 1 < attempts.length &&
@@ -1281,8 +1386,6 @@ async function handleChatCompletions(req, res, providerId) {
     if (!finished) activeCurl?.kill();
   });
 
-  // Don't write response headers yet — if we need to fall back to the
-  // non-streaming path we want to reuse the same res object.
   startAttempt(0);
 }
 
@@ -1755,6 +1858,11 @@ const server = createServer(async (req, res) => {
 
   if (req.method === "GET" && pathname === "/bootstrap") {
     sendJson(res, 200, { ok: true, settings: BOOTSTRAP_SETTINGS });
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/logs") {
+    sendJson(res, 200, { ok: true, logs: RELAY_LOG_BUFFER.slice() });
     return;
   }
 
