@@ -482,7 +482,9 @@ function resolveUpstreamProxy(req, body = null) {
 function formatCurlFailure(stderr) {
   const message = String(stderr || "").trim();
   if (!message) return "Failed to reach upstream.";
-  return message.replace(/^curl:\s*/i, "");
+  return message
+    .replace(/^curl:\s*/i, "")
+    .replace(/^\(\d+\)\s*/, "");
 }
 
 function isProxyConnectionFailure(message) {
@@ -696,12 +698,21 @@ function parseUpstreamErrorBody(body) {
   if (!trimmed) return "";
   try {
     const json = JSON.parse(trimmed);
-    return (
-      json?.error?.message ||
-      json?.error?.code ||
-      json?.message ||
-      JSON.stringify(json).slice(0, 400)
-    );
+    if (json?.error) {
+      const parts = [];
+      if (json.error.message) parts.push(String(json.error.message));
+      if (json.error.code && json.error.code !== json.error.message) {
+        parts.push(`code=${json.error.code}`);
+      }
+      const providerName = json.error.metadata?.provider_name;
+      if (providerName) parts.push(`provider=${providerName}`);
+      const raw = json.error.metadata?.raw;
+      if (raw && typeof raw === "string") {
+        parts.push(`upstream=${raw.slice(0, 200)}`);
+      }
+      if (parts.length > 0) return parts.join(" | ");
+    }
+    return json?.message || JSON.stringify(json).slice(0, 400);
   } catch {
     return trimmed.slice(0, 400);
   }
