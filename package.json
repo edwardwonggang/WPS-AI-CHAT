@@ -29,7 +29,7 @@
 		"remark-gfm": "^4.0.1",
 		"remark-math": "^6.0.0",
 		"streaming-markdown": "^0.2.15",
-		"undici": "^8.2.0"
+		"undici": "^5.29.0"
 	},
 	"devDependencies": {
 		"@vitejs/plugin-react": "^4.3.4",

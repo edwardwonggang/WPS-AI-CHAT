@@ -11,7 +11,38 @@ import {
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { ProxyAgent, Agent, fetch as undiciFetch } from "undici";
+
+// Node 18+ ships undici internally but doesn't expose ProxyAgent via a stable
+// public entry. We depend on the `undici` npm package (v5, compatible back to
+// Node 16.8+) which provides ProxyAgent, Agent, and a standards-aligned fetch.
+let ProxyAgent;
+let Agent;
+let undiciFetch;
+try {
+  const undici = await import("undici");
+  ProxyAgent = undici.ProxyAgent;
+  Agent = undici.Agent;
+  undiciFetch = undici.fetch;
+} catch (error) {
+  console.error(
+    "[relay] Failed to load the 'undici' package. Run `npm install` inside the project directory and retry."
+  );
+  console.error(
+    "[relay] Details:",
+    error instanceof Error ? error.message : String(error)
+  );
+  process.exit(1);
+}
+
+// Sanity check: undici v5 requires Node 16.8+. If the runtime is older we
+// surface a friendly message instead of cryptic internal errors.
+const nodeMajor = Number(process.versions.node.split(".")[0] || 0);
+if (nodeMajor < 18) {
+  console.error(
+    `[relay] Node ${process.versions.node} is too old. Install Node 18 LTS or newer and relaunch.`
+  );
+  process.exit(1);
+}
 
 const PORT = 3888;
 const RELAY_CONFIG_URL = new URL("./relay.config.json", import.meta.url);
