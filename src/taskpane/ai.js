@@ -44,6 +44,7 @@ export const DEFAULT_SETTINGS = {
   },
   proxyUrl: "",
   useRelay: true,
+  streamingMode: "auto",
   temperature: 0.5,
   maxTokens: "",
   systemPrompt:
@@ -451,11 +452,14 @@ function createRelayRequestHeaders(settings, provider, extra = {}) {
   };
 
   const proxyUrl = String(settings.proxyUrl ?? "").trim();
-  if (proxyUrl) {
-    headers["X-Upstream-Proxy"] = proxyUrl;
-  } else {
+  if (proxyUrl.toLowerCase() === "direct") {
     headers["X-Upstream-Proxy"] = "__direct__";
+  } else if (proxyUrl) {
+    headers["X-Upstream-Proxy"] = proxyUrl;
   }
+  // Leave the header unset so the relay falls back to its configured/system
+  // proxy. Previously we always forced `__direct__` here, which silently
+  // disabled system proxies for users who left the field empty.
 
   if (provider.providerId === "openrouter") {
     headers["HTTP-Referer"] = String(settings.referer ?? "").trim() || "https://localhost";
@@ -472,6 +476,7 @@ function createRelayChatFormBody(settings, messages) {
   params.set("baseUrl", String(provider.baseUrl ?? "").trim());
   params.set("proxyUrl", String(settings.proxyUrl ?? "").trim());
   params.set("provider", provider.providerId);
+  params.set("streamingMode", String(settings.streamingMode ?? "auto"));
   if (provider.providerId === "openrouter") {
     params.set("referer", String(settings.referer ?? "").trim() || "https://localhost");
     params.set("title", String(settings.title ?? "").trim() || "WPS AI");
@@ -772,9 +777,23 @@ export async function* streamModelBenchmarks({
   for await (const payload of streamSseViaXhr({
     url: `${provider.relayPrefix}/benchmark`,
     headers: createRelayRequestHeaders(settings, providerRecord),
-    body: JSON.stringify({ models, timeoutMs, concurrency }),
+    body: JSON.stringify({
+      models,
+      timeoutMs,
+      concurrency,
+      streamingMode: settings.streamingMode || "auto"
+    }),
     signal
   })) {
+    if (payload?.type === "relay_debug") {
+      pushDebugLog(
+        payload.level === "error" ? "error" : "info",
+        `relay:${payload.scope || "bench"}`,
+        String(payload.message || ""),
+        payload.details || {}
+      );
+      continue;
+    }
     if (payload) yield payload;
   }
 }

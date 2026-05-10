@@ -851,12 +851,12 @@ function classifyBenchmarkFailure(stderr) {
   return { status: "error", message: formatCurlFailure(message) };
 }
 
-function createBenchmarkBody(model) {
+function createBenchmarkBody(model, bufferedOnly = false) {
   return JSON.stringify({
     model,
     messages: BENCHMARK_MESSAGES,
     temperature: 0,
-    stream: true,
+    stream: !bufferedOnly,
     max_tokens: 8
   });
 }
@@ -867,7 +867,8 @@ function benchmarkModel({
   model,
   timeoutMs,
   preferredProxy,
-  extraHeaders = []
+  extraHeaders = [],
+  bufferedOnly = false
 }) {
   return new Promise((resolvePromise) => {
     const startedAt = Date.now();
@@ -876,6 +877,7 @@ function benchmarkModel({
     let firstTokenMs = null;
     let settled = false;
     let activeCurl = null;
+    let nonSseDetected = false;
 
     const attempts = buildAttemptEnvs(preferredProxy);
 
@@ -894,7 +896,8 @@ function benchmarkModel({
         status,
         firstByteMs,
         firstTokenMs,
-        totalMs: firstTokenMs !== null ? firstTokenMs : Math.max(0, Date.now() - startedAt),
+        totalMs:
+          firstTokenMs !== null ? firstTokenMs : Math.max(0, Date.now() - startedAt),
         message: message || ""
       });
     }
@@ -916,7 +919,7 @@ function benchmarkModel({
           method: "POST",
           headers: ["Content-Type: application/json", ...extraHeaders],
           dataFromStdin: true,
-          stream: true
+          stream: !bufferedOnly
         }),
         {
           env: attempt.env,
@@ -926,7 +929,10 @@ function benchmarkModel({
       );
 
       activeCurl.on("error", (error) => {
-        finalize("error", error instanceof Error ? error.message : "Failed to start curl");
+        finalize(
+          "error",
+          error instanceof Error ? error.message : "Failed to start curl"
+        );
       });
 
       activeCurl.stderr.on("data", (chunk) => {
@@ -937,13 +943,35 @@ function benchmarkModel({
         if (firstByteMs === null) {
           firstByteMs = Math.max(0, Date.now() - startedAt);
         }
-        buffer += chunk.toString("utf8");
+
+        const text = chunk.toString("utf8");
+        buffer += text;
+
+        if (bufferedOnly) {
+          // Wait for full JSON at `close`.
+          return;
+        }
+
+        // Detect non-SSE body (proxy error page).
+        if (!nonSseDetected && buffer.length > 4) {
+          const preview = buffer.trimStart();
+          const looksLikeSse =
+            preview.startsWith("data:") ||
+            preview.startsWith(":") ||
+            preview.startsWith("event:");
+          if (!looksLikeSse) {
+            nonSseDetected = true;
+          }
+        }
+
+        if (nonSseDetected) return;
+
         const parts = buffer.split(/\r?\n\r?\n/);
         buffer = parts.pop() ?? "";
         for (const part of parts) {
           const payload = parseSseEvent(part);
-          const text = extractChunk(payload);
-          if (text && firstTokenMs === null) {
+          const tokenText = extractChunk(payload);
+          if (tokenText && firstTokenMs === null) {
             firstTokenMs = Math.max(0, Date.now() - startedAt);
             finalize("ok", "");
             return;
@@ -952,12 +980,48 @@ function benchmarkModel({
       });
 
       activeCurl.on("close", () => {
-        if (settled) return;
-        if (attemptCompleted) return;
+        if (settled || attemptCompleted) return;
         attemptCompleted = true;
 
         if (firstTokenMs !== null) {
           finalize("ok", "");
+          return;
+        }
+
+        // Non-streaming mode: parse the final JSON to determine success.
+        if (bufferedOnly) {
+          try {
+            const json = JSON.parse(buffer);
+            if (json?.error) {
+              finalize(
+                "error",
+                parseUpstreamErrorBody(buffer) ||
+                  String(json.error?.message || "Upstream error")
+              );
+              return;
+            }
+            const content = normalizeContent(json?.choices?.[0]?.message?.content);
+            if (content) {
+              firstTokenMs = Math.max(0, Date.now() - startedAt);
+              finalize("ok", "");
+              return;
+            }
+            finalize("error", "Empty response");
+          } catch {
+            // Not JSON — likely a proxy error page.
+            const preview = String(buffer || "").trim().slice(0, 200);
+            finalize("error", preview || "Non-JSON upstream response");
+          }
+          return;
+        }
+
+        // Streaming path: report proxy error body if detected.
+        if (nonSseDetected) {
+          const preview = String(buffer || "").trim();
+          finalize(
+            "error",
+            parseUpstreamErrorBody(preview) || preview.slice(0, 200) || "Non-SSE upstream body"
+          );
           return;
         }
 
@@ -979,7 +1043,7 @@ function benchmarkModel({
         finalize(failure.status, failure.message);
       });
 
-      activeCurl.stdin.end(createBenchmarkBody(model));
+      activeCurl.stdin.end(createBenchmarkBody(model, bufferedOnly));
     }
 
     startAttempt(0);
@@ -1069,6 +1133,7 @@ async function handleChatCompletions(req, res, providerId) {
   const baseUrl = resolveUpstreamBaseUrl(req, providerId, body);
   const preferredProxy = resolveUpstreamProxy(req, body);
   const extraHeaders = buildProviderExtraHeaders(providerId, req, body);
+  const streamingMode = String(body?.streamingMode ?? "auto").toLowerCase();
 
   const upstreamUrl = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
 
@@ -1099,6 +1164,7 @@ async function handleChatCompletions(req, res, providerId) {
     upstreamUrl,
     model: String(payloadBody?.model || ""),
     stream: payloadBody?.stream !== false,
+    streamingMode,
     preferredProxy: preferredProxy || "(direct)",
     systemProxy: SYSTEM_PROXY || "",
     authHeader: sanitizeAuthHeader(authorization),
@@ -1112,6 +1178,12 @@ async function handleChatCompletions(req, res, providerId) {
   let activeCurl = null;
   let nonStreamingFallbackUsed = false;
   const attempts = buildAttemptEnvs(preferredProxy);
+
+  // If the caller asked to skip streaming, go straight to the buffered path.
+  if (streamingMode === "buffered") {
+    void runNonStreamingFallback("streamingMode=buffered");
+    return;
+  }
 
   function fail(message) {
     if (finished) return;
@@ -1407,6 +1479,8 @@ async function handleBenchmark(req, res, providerId) {
   const baseUrl = resolveUpstreamBaseUrl(req, providerId, body);
   const preferredProxy = resolveUpstreamProxy(req, body);
   const extraHeaders = buildProviderExtraHeaders(providerId, req, body);
+  const streamingMode = String(body?.streamingMode ?? "auto").toLowerCase();
+  const bufferedOnly = streamingMode === "buffered";
 
   const models = Array.from(
     new Set(
@@ -1476,7 +1550,8 @@ async function handleBenchmark(req, res, providerId) {
           model,
           timeoutMs,
           preferredProxy,
-          extraHeaders
+          extraHeaders,
+          bufferedOnly
         })
           .then((result) => {
             results.push(result);
