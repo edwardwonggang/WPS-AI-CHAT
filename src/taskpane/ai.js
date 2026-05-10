@@ -326,6 +326,32 @@ async function requestJson(options) {
   return { ...response, json };
 }
 
+async function fetchRelayLogsIntoDebug() {
+  try {
+    const response = await requestJson({
+      url: `${RELAY_BASE_URL}/logs`,
+      method: "GET"
+    });
+    if (!response.ok || !Array.isArray(response.json?.logs)) return;
+    const logs = response.json.logs;
+    // Only show logs from the last 30 seconds so we don't drown out older
+    // noise when the user retries a failing request.
+    const cutoff = Date.now() - 30 * 1000;
+    for (const entry of logs) {
+      const ts = Date.parse(entry?.time || "") || 0;
+      if (ts && ts < cutoff) continue;
+      pushDebugLog(
+        entry.level === "error" ? "error" : "info",
+        `relay:${entry.scope || "chat"}`,
+        String(entry.message || ""),
+        entry.details || {}
+      );
+    }
+  } catch {
+    // Relay may be unreachable; skip.
+  }
+}
+
 export async function loadBootstrapSettings(signal) {
   try {
     pushDebugLog("info", "bootstrap", "Loading relay bootstrap settings.");
@@ -834,7 +860,17 @@ export async function* streamCompletion({ settings, messages, signal }) {
 
   pushDebugLog("info", "generation", "Preparing streamed completion.", {
     provider: provider.providerId,
-    model: provider.model
+    model: provider.model,
+    baseUrl: provider.baseUrl,
+    proxyUrl: settings.proxyUrl || "(system)",
+    temperature: settings.temperature,
+    maxTokens: settings.maxTokens || "auto",
+    messagesCount: Array.isArray(messages) ? messages.length : 0,
+    apiKeyPreview: provider.apiKey
+      ? `${String(provider.apiKey).slice(0, 8)}...(len=${String(provider.apiKey).length})`
+      : "(empty)",
+    referer: settings.referer,
+    title: settings.title
   });
 
   try {
@@ -874,6 +910,18 @@ export async function* streamCompletion({ settings, messages, signal }) {
       body: requestBody,
       signal: requestController.signal
     })) {
+      // Relay forwards its own internal diagnostics as `relay_debug` events
+      // so every step of the upstream handshake shows up in the plugin log.
+      if (payload?.type === "relay_debug") {
+        pushDebugLog(
+          payload.level === "error" ? "error" : "info",
+          `relay:${payload.scope || "chat"}`,
+          String(payload.message || ""),
+          payload.details || {}
+        );
+        continue;
+      }
+
       receivedEvent = true;
 
       if (payload?.error?.message) {
@@ -899,6 +947,7 @@ export async function* streamCompletion({ settings, messages, signal }) {
         ? "The relay stream completed without any text output."
         : "The relay stream closed without returning any events.";
       pushDebugLog("error", "generation", message);
+      await fetchRelayLogsIntoDebug();
       throw new Error(message);
     }
 
@@ -911,11 +960,13 @@ export async function* streamCompletion({ settings, messages, signal }) {
     }
     if (timedOutBeforeFirstChunk) {
       pushDebugLog("error", "generation", "Timed out before first text chunk.");
+      await fetchRelayLogsIntoDebug();
       throw new Error(getTimeoutError(settings));
     }
     pushDebugLog("error", "generation", "Streamed completion failed.", {
       error: error instanceof Error ? error.message : String(error)
     });
+    await fetchRelayLogsIntoDebug();
     throw error;
   }
 }
