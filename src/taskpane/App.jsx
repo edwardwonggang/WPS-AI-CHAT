@@ -2,10 +2,13 @@ import {
   Clipboard,
   Eraser,
   Gauge,
+  KeyRound,
+  Link as LinkIcon,
+  RefreshCw,
   ScrollText,
   SendHorizontal,
   ServerCog,
-  SlidersHorizontal,
+  Settings as SettingsIcon,
   Square,
   Trash2,
   X
@@ -15,11 +18,12 @@ import {
   DEFAULT_SETTINGS,
   PROVIDERS,
   buildMessages,
+  getActiveProviderRecord,
   loadBootstrapSettings,
-  loadNvidiaModels,
+  loadProviderModels,
   normalizeSettings,
   streamCompletion,
-  streamNvidiaModelBenchmarks
+  streamModelBenchmarks
 } from "./ai";
 import StreamingMarkdown from "./StreamingMarkdown";
 import {
@@ -61,21 +65,32 @@ function createMessageId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function placeholderModel(providerId) {
-  return PROVIDERS[providerId]?.placeholderModel ?? "";
-}
-
+/**
+ * Merge bootstrap settings from the relay into existing local settings. Local
+ * settings always win; bootstrap only fills gaps.
+ */
 function mergeBootstrapSettings(current, bootstrap) {
   const normalizedCurrent = normalizeSettings(current);
   const normalizedBootstrap = normalizeSettings(bootstrap);
 
+  const mergedProviders = {};
+  for (const providerId of Object.keys(PROVIDERS)) {
+    const currentRecord = normalizedCurrent.providers[providerId] || {};
+    const bootstrapRecord = normalizedBootstrap.providers[providerId] || {};
+    mergedProviders[providerId] = {
+      baseUrl: currentRecord.baseUrl || bootstrapRecord.baseUrl,
+      apiKey: currentRecord.apiKey || bootstrapRecord.apiKey,
+      model: currentRecord.model || bootstrapRecord.model
+    };
+  }
+
   return normalizeSettings({
     ...normalizedCurrent,
-    apiKey: normalizedCurrent.apiKey || normalizedBootstrap.apiKey,
-    model: normalizedCurrent.model || normalizedBootstrap.model,
-    baseUrl: normalizedCurrent.baseUrl || normalizedBootstrap.baseUrl,
+    providers: mergedProviders,
+    proxyUrl: normalizedCurrent.proxyUrl || normalizedBootstrap.proxyUrl,
     firstTokenTimeoutMs:
-      normalizedCurrent.firstTokenTimeoutMs || normalizedBootstrap.firstTokenTimeoutMs
+      normalizedCurrent.firstTokenTimeoutMs ||
+      normalizedBootstrap.firstTokenTimeoutMs
   });
 }
 
@@ -87,19 +102,13 @@ function normalizeVisibleDelayMs(value) {
 }
 
 async function postTestCommandJson(path, payload) {
-  const response = await fetch(`${TEST_COMMAND_BASE_URL}${path}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(payload)
-  });
-
-  if (!response.ok) {
-    return null;
-  }
-
   try {
+    const response = await fetch(`${TEST_COMMAND_BASE_URL}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) return null;
     return await response.json();
   } catch {
     return null;
@@ -107,77 +116,18 @@ async function postTestCommandJson(path, payload) {
 }
 
 function acknowledgeTestCommand(id, stage, document, detail = {}) {
-  if (!id) {
-    return;
-  }
-
-  void postTestCommandJson("/ack", {
-    id,
-    stage,
-    document,
-    detail
-  });
+  if (!id) return;
+  void postTestCommandJson("/ack", { id, stage, document, detail });
 }
 
 function modelEntryTitle(entry) {
-  const lines = [entry.id, entry.ownedBy || "nvidia", benchmarkLabel(entry)];
-
-  if (entry.benchmark?.message) {
-    lines.push(entry.benchmark.message);
-  }
-
-  return lines.join("\n");
-}
-
-const E2E_RICH_FORMAT_SAMPLE = [
-  "# E2E Title",
-  "",
-  "This is the first body paragraph used to verify standard paper formatting, first-line indentation, left alignment, and comfortable line spacing.",
-  "",
-  "This is the second body paragraph used to confirm content is appended at the document end and that real-time paragraph formatting remains stable.",
-  "",
-  "## List Check",
-  "",
-  "- List item one",
-  "- List item two",
-  "",
-  "## Code Block Check",
-  "",
-  "```js",
-  "function sum(a, b) {",
-  "  return a + b;",
-  "}",
-  "```",
-  "",
-  "## Formula Check",
-  "",
-  "$$",
-  "E = mc^2",
-  "$$",
-  "",
-  "## Table Check",
-  "",
-  "| Person | Role |",
-  "| --- | --- |",
-  "| Gattuso | Patriarch<br>Current: effective leader of the New Secret Party |",
-  "| Vito | Elder |"
-].join("\n");
-
-function shouldRunWpsE2E() {
-  if (!hasWpsDocument()) {
-    return false;
-  }
-
-  try {
-    const url = new URL(window.location.href);
-    return url.searchParams.get("e2e") === "rich-format";
-  } catch {
-    return false;
-  }
+  const lines = [entry.id, entry.ownedBy || "", benchmarkLabel(entry)];
+  if (entry.benchmark?.message) lines.push(entry.benchmark.message);
+  return lines.filter(Boolean).join("\n");
 }
 
 const ICONS = {
-  settings: SlidersHorizontal,
+  settings: SettingsIcon,
   clear: Eraser,
   send: SendHorizontal,
   stop: Square,
@@ -186,12 +136,15 @@ const ICONS = {
   flask: Gauge,
   logs: ScrollText,
   copy: Clipboard,
-  trash: Trash2
+  trash: Trash2,
+  key: KeyRound,
+  link: LinkIcon,
+  refresh: RefreshCw
 };
 
-function Icon({ name }) {
+function Icon({ name, size = 17 }) {
   const Component = ICONS[name];
-  return Component ? <Component size={17} strokeWidth={1.85} /> : null;
+  return Component ? <Component size={size} strokeWidth={1.85} /> : null;
 }
 
 export default function App() {
@@ -207,8 +160,22 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showModelLab, setShowModelLab] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
-  const [modelCatalog, setModelCatalog] = useState(() =>
-    normalizeModelCatalogState(loadStoredValue(MODEL_CATALOG_KEY, []))
+  const [settingsTab, setSettingsTab] = useState(() => settings.activeProvider);
+  const [modelCatalogsByProvider, setModelCatalogsByProvider] = useState(() => {
+    const legacy = loadStoredValue(MODEL_CATALOG_KEY, null);
+    if (Array.isArray(legacy)) {
+      return { nvidia: normalizeModelCatalogState(legacy), openrouter: [] };
+    }
+    if (legacy && typeof legacy === "object") {
+      return {
+        nvidia: normalizeModelCatalogState(legacy.nvidia),
+        openrouter: normalizeModelCatalogState(legacy.openrouter)
+      };
+    }
+    return { nvidia: [], openrouter: [] };
+  });
+  const [modelLabProvider, setModelLabProvider] = useState(
+    () => settings.activeProvider
   );
   const [modelSearch, setModelSearch] = useState("");
   const [isLoadingModels, setIsLoadingModels] = useState(false);
@@ -231,16 +198,13 @@ export default function App() {
   const isGeneratingRef = useRef(false);
   const handleGenerateRef = useRef(null);
   const latestMessagesRef = useRef([]);
-  const messageBufferRef = useRef({
-    chunk: "",
-    messageId: "",
-    timerId: null
-  });
-  const sessionLoadRef = useRef({
-    busy: false,
-    token: 0
-  });
+  const messageBufferRef = useRef({ chunk: "", messageId: "", timerId: null });
+  const sessionLoadRef = useRef({ busy: false, token: 0 });
   const sessionSaveTimerRef = useRef(null);
+
+  const activeProviderRecord = getActiveProviderRecord(settings);
+  const currentCatalog =
+    modelCatalogsByProvider[modelLabProvider] || [];
 
   useEffect(() => {
     saveStoredValue(SETTINGS_KEY, settings);
@@ -251,8 +215,8 @@ export default function App() {
   }, [prompt]);
 
   useEffect(() => {
-    saveStoredValue(MODEL_CATALOG_KEY, modelCatalog);
-  }, [modelCatalog]);
+    saveStoredValue(MODEL_CATALOG_KEY, modelCatalogsByProvider);
+  }, [modelCatalogsByProvider]);
 
   useEffect(() => {
     return subscribeDebugLogs(setDebugLogs);
@@ -273,51 +237,20 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!shouldRunWpsE2E()) {
-      return;
-    }
-
-    const e2eKey = "wps_ai_e2e_rich_format_done";
-    if (window.sessionStorage.getItem(e2eKey) === "1") {
-      return;
-    }
-
-    const timerId = window.setTimeout(() => {
-      try {
-        const sink = createWpsMarkdownSink({ replaceSelection: false });
-        sink.write(E2E_RICH_FORMAT_SAMPLE);
-        sink.finish();
-        window.sessionStorage.setItem(e2eKey, "1");
-      } catch (e) {
-        console.error("WPS E2E table test failed:", e);
-      }
-    }, 1200);
-
-    return () => window.clearTimeout(timerId);
-  }, []);
-
-  useEffect(() => {
     function refreshDocumentInfo() {
-      if (isGeneratingRef.current) {
-        return;
-      }
-
+      if (isGeneratingRef.current) return;
       const next = readDocumentInfo();
-
       setDocumentInfo((current) => {
         const currentKey = current?.key ?? "";
         const nextKey = next?.key ?? "";
         const currentTitle = current?.title ?? "";
         const nextTitle = next?.title ?? "";
-
         if (currentKey === nextKey && currentTitle === nextTitle) {
           return current;
         }
-
         return next;
       });
     }
-
     refreshDocumentInfo();
     const timerId = window.setInterval(refreshDocumentInfo, 1500);
     return () => window.clearInterval(timerId);
@@ -325,42 +258,30 @@ export default function App() {
 
   useEffect(() => {
     const controller = new AbortController();
-
     void loadBootstrapSettings(controller.signal).then((bootstrapSettings) => {
-      if (!bootstrapSettings) {
-        return;
-      }
-
-      setSettings((current) => mergeBootstrapSettings(current, bootstrapSettings));
+      if (!bootstrapSettings) return;
+      setSettings((current) =>
+        mergeBootstrapSettings(current, bootstrapSettings)
+      );
     });
-
     return () => controller.abort();
   }, []);
 
   useEffect(() => {
     const textarea = promptRef.current;
-    if (!textarea) {
-      return;
-    }
-
+    if (!textarea) return;
     textarea.style.height = "0px";
     textarea.style.height = `${Math.min(textarea.scrollHeight, 220)}px`;
   }, [prompt]);
 
   useEffect(() => {
     const thread = threadRef.current;
-    if (!thread || !shouldStickToBottomRef.current) {
-      return;
-    }
-
+    if (!thread || !shouldStickToBottomRef.current) return;
     thread.scrollTop = thread.scrollHeight;
   }, [messages]);
 
   useEffect(() => {
-    if (!showSettings && !showModelLab && !showLogs) {
-      return undefined;
-    }
-
+    if (!showSettings && !showModelLab && !showLogs) return undefined;
     function onKeyDown(event) {
       if (event.key === "Escape") {
         setShowSettings(false);
@@ -368,41 +289,11 @@ export default function App() {
         setShowLogs(false);
       }
     }
-
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [showLogs, showModelLab, showSettings]);
 
-  useEffect(() => {
-    if (
-      !showModelLab ||
-      settings.providerId !== "nvidia" ||
-      isLoadingModels ||
-      isBenchmarkingModels
-    ) {
-      return;
-    }
-
-    if (modelCatalog.length === 0) {
-      void handleLoadModels();
-      return;
-    }
-
-    const hasBenchmarkedModels = modelCatalog.some(
-      (entry) => entry.benchmark?.status && entry.benchmark.status !== "untested"
-    );
-
-    if (!hasBenchmarkedModels) {
-      void handleBenchmarkModels();
-    }
-  }, [
-    isBenchmarkingModels,
-    isLoadingModels,
-    modelCatalog,
-    showModelLab,
-    settings.providerId
-  ]);
-
+  // Session load/save effects (unchanged from original)
   useEffect(() => {
     const nextDocument = documentInfo;
     const nextKey = nextDocument?.key ?? "";
@@ -413,7 +304,6 @@ export default function App() {
       if (previousDocument?.key && previousMessages.length > 0) {
         void saveDocumentSession(previousDocument, previousMessages).catch(() => {});
       }
-
       activeDocumentRef.current = nextDocument;
       setMessages([]);
       return undefined;
@@ -453,7 +343,9 @@ export default function App() {
           previousMessages.length > 0 &&
           !session.exists;
 
-        const nextMessages = shouldCarryForward ? previousMessages : session.messages;
+        const nextMessages = shouldCarryForward
+          ? previousMessages
+          : session.messages;
 
         setMessages(nextMessages);
         setSelectionText(readSelectionText());
@@ -473,7 +365,6 @@ export default function App() {
         ) {
           return;
         }
-
         setMessages([]);
       })
       .finally(() => {
@@ -492,14 +383,10 @@ export default function App() {
       window.clearTimeout(sessionSaveTimerRef.current);
       sessionSaveTimerRef.current = null;
     }
-
     if (!documentInfo?.key || sessionLoadRef.current.busy || isGenerating) {
       return undefined;
     }
-
-    if (messages.length === 0) {
-      return undefined;
-    }
+    if (messages.length === 0) return undefined;
 
     sessionSaveTimerRef.current = window.setTimeout(() => {
       sessionSaveTimerRef.current = null;
@@ -519,14 +406,12 @@ export default function App() {
       if (sessionSaveTimerRef.current !== null) {
         window.clearTimeout(sessionSaveTimerRef.current);
       }
-
       if (activeDocumentRef.current?.key && latestMessagesRef.current.length > 0) {
         void saveDocumentSession(
           activeDocumentRef.current,
           latestMessagesRef.current
         ).catch(() => {});
       }
-
       if (messageBufferRef.current.timerId !== null) {
         window.clearTimeout(messageBufferRef.current.timerId);
       }
@@ -536,19 +421,43 @@ export default function App() {
     };
   }, []);
 
+  // -------- Settings mutation helpers --------
   function updateSetting(key, value) {
     setSettings((current) => normalizeSettings({ ...current, [key]: value }));
+  }
+
+  function updateProviderSetting(providerId, key, value) {
+    setSettings((current) =>
+      normalizeSettings({
+        ...current,
+        providers: {
+          ...current.providers,
+          [providerId]: {
+            ...(current.providers?.[providerId] || {}),
+            [key]: value
+          }
+        }
+      })
+    );
+  }
+
+  function selectActiveProvider(providerId) {
+    setSettings((current) =>
+      normalizeSettings({ ...current, activeProvider: providerId })
+    );
   }
 
   function openSettings() {
     setShowModelLab(false);
     setShowLogs(false);
+    setSettingsTab(settings.activeProvider);
     setShowSettings(true);
   }
 
-  function openModelLab() {
+  function openModelLab(providerId) {
     setShowSettings(false);
     setShowLogs(false);
+    setModelLabProvider(providerId || settings.activeProvider);
     setShowModelLab(true);
   }
 
@@ -558,22 +467,9 @@ export default function App() {
     setShowLogs(true);
   }
 
-  function switchProvider(providerId) {
-    setSettings((current) =>
-      normalizeSettings({
-        ...current,
-        providerId,
-        baseUrl: PROVIDERS[providerId].defaultBaseUrl
-      })
-    );
-  }
-
   function handleThreadScroll() {
     const thread = threadRef.current;
-    if (!thread) {
-      return;
-    }
-
+    if (!thread) return;
     const distanceToBottom =
       thread.scrollHeight - thread.scrollTop - thread.clientHeight;
     shouldStickToBottomRef.current = distanceToBottom < 40;
@@ -590,33 +486,21 @@ export default function App() {
   function flushBufferedAssistantMessage(targetMessageId = "") {
     const buffer = messageBufferRef.current;
     const messageId = targetMessageId || buffer.messageId;
-
     if (!buffer.chunk || !messageId) {
-      if (!targetMessageId) {
-        buffer.messageId = "";
-      }
+      if (!targetMessageId) buffer.messageId = "";
       return;
     }
-
     if (buffer.timerId !== null) {
       window.clearTimeout(buffer.timerId);
       buffer.timerId = null;
     }
-
     const chunk = buffer.chunk;
     buffer.chunk = "";
-    if (!targetMessageId) {
-      buffer.messageId = "";
-    }
-
+    if (!targetMessageId) buffer.messageId = "";
     setMessages((current) =>
       current.map((message) =>
         message.id === messageId
-          ? {
-              ...message,
-              content: `${message.content}${chunk}`,
-              streaming: true
-            }
+          ? { ...message, content: `${message.content}${chunk}`, streaming: true }
           : message
       )
     );
@@ -625,33 +509,30 @@ export default function App() {
   function queueAssistantChunk(messageId, chunk) {
     const buffer = messageBufferRef.current;
     const shouldFlushImmediately = !buffer.chunk || chunk.includes("\n");
-
     if (buffer.messageId && buffer.messageId !== messageId) {
       flushBufferedAssistantMessage(buffer.messageId);
       buffer.messageId = "";
     }
-
     buffer.messageId = messageId;
     buffer.chunk += chunk;
-
     if (shouldFlushImmediately) {
       flushBufferedAssistantMessage(messageId);
       return;
     }
-
-    if (buffer.timerId !== null) {
-      return;
-    }
-
+    if (buffer.timerId !== null) return;
     buffer.timerId = window.setTimeout(() => {
       messageBufferRef.current.timerId = null;
       flushBufferedAssistantMessage(messageId);
     }, 8);
   }
 
-  async function handleLoadModels() {
-    if (!settings.apiKey.trim()) {
-      setModelLabError("Enter the API key before loading NVIDIA models.");
+  // -------- Model loading / benchmarking --------
+  async function handleLoadModels(targetProviderId = modelLabProvider) {
+    const provider = settings.providers[targetProviderId];
+    if (!provider?.apiKey?.trim()) {
+      setModelLabError(
+        `Enter the ${PROVIDERS[targetProviderId].label} API key before loading models.`
+      );
       return;
     }
 
@@ -659,15 +540,21 @@ export default function App() {
     setModelLabError("");
 
     try {
-      const items = await loadNvidiaModels({
-        apiKey: settings.apiKey,
+      const items = await loadProviderModels({
         settings,
+        providerId: targetProviderId,
         signal: undefined
       });
 
-      setModelCatalog((current) => {
-        const currentMap = new Map(current.map((entry) => [entry.id, entry]));
-        return items.map((item) => createModelEntry(item, currentMap.get(item.id)));
+      setModelCatalogsByProvider((current) => {
+        const existing = current[targetProviderId] || [];
+        const previousMap = new Map(existing.map((entry) => [entry.id, entry]));
+        return {
+          ...current,
+          [targetProviderId]: items.map((item) =>
+            createModelEntry(item, previousMap.get(item.id))
+          )
+        };
       });
     } catch (caught) {
       setModelLabError(
@@ -678,23 +565,29 @@ export default function App() {
     }
   }
 
-  async function handleBenchmarkModels() {
-    if (!settings.apiKey.trim()) {
-      setModelLabError("Enter the API key before running model benchmarks.");
+  async function handleBenchmarkModels(targetProviderId = modelLabProvider) {
+    const provider = settings.providers[targetProviderId];
+    if (!provider?.apiKey?.trim()) {
+      setModelLabError(
+        `Enter the ${PROVIDERS[targetProviderId].label} API key before running benchmarks.`
+      );
       return;
     }
 
-    let items = modelCatalog;
+    let items = modelCatalogsByProvider[targetProviderId] || [];
     if (items.length === 0) {
       setIsLoadingModels(true);
       try {
-        const fetched = await loadNvidiaModels({
-          apiKey: settings.apiKey,
+        const fetched = await loadProviderModels({
           settings,
+          providerId: targetProviderId,
           signal: undefined
         });
         items = fetched.map((item) => createModelEntry(item));
-        setModelCatalog(items);
+        setModelCatalogsByProvider((current) => ({
+          ...current,
+          [targetProviderId]: items
+        }));
       } catch (caught) {
         setModelLabError(
           caught instanceof Error ? caught.message : "Failed to load models."
@@ -709,16 +602,13 @@ export default function App() {
     benchmarkAbortRef.current = controller;
     setIsBenchmarkingModels(true);
     setModelLabError("");
-    setBenchmarkProgress({
-      completed: 0,
-      total: items.length
-    });
+    setBenchmarkProgress({ completed: 0, total: items.length });
 
     try {
-      for await (const event of streamNvidiaModelBenchmarks({
-        apiKey: settings.apiKey,
-        models: items.map((entry) => entry.id),
+      for await (const event of streamModelBenchmarks({
         settings,
+        providerId: targetProviderId,
+        models: items.map((entry) => entry.id),
         timeoutMs: 20000,
         concurrency: 6,
         signal: controller.signal
@@ -730,16 +620,20 @@ export default function App() {
           });
           continue;
         }
-
         if (event.type === "result" && event.result) {
           setBenchmarkProgress({
             completed: Number(event.completed) || 0,
             total: Number(event.total) || items.length
           });
-          setModelCatalog((current) => applyBenchmarkResult(current, event.result));
+          setModelCatalogsByProvider((current) => ({
+            ...current,
+            [targetProviderId]: applyBenchmarkResult(
+              current[targetProviderId] || [],
+              event.result
+            )
+          }));
           continue;
         }
-
         if (event.type === "done") {
           setBenchmarkProgress({
             completed: Number(event.completed) || items.length,
@@ -760,33 +654,36 @@ export default function App() {
   }
 
   function applyModel(modelId) {
-    updateSetting("model", modelId);
+    updateProviderSetting(modelLabProvider, "model", modelId);
+    if (modelLabProvider !== settings.activeProvider) {
+      selectActiveProvider(modelLabProvider);
+    }
     setShowModelLab(false);
     setModelSearch("");
   }
 
+  // -------- Main generation handler --------
   async function handleGenerate(promptOverride = prompt) {
     const trimmedPrompt = String(promptOverride ?? "").trim();
-    if (!settings.apiKey.trim()) {
-      setError("Enter the API key first.");
+    const activeProvider = getActiveProviderRecord(settings);
+
+    if (!activeProvider.apiKey?.trim()) {
+      setError(`Enter the ${PROVIDERS[activeProvider.providerId].label} API key first.`);
       openSettings();
       return;
     }
-
-    if (!settings.model.trim()) {
-      setError("Enter the model name first.");
+    if (!activeProvider.model?.trim()) {
+      setError("Select or enter a model first.");
       openSettings();
       return;
     }
-
-    if (!trimmedPrompt) {
-      return;
-    }
+    if (!trimmedPrompt) return;
 
     setError("");
     setIsGenerating(true);
     pushDebugLog("info", "ui", "User submitted a generation request.", {
-      promptLength: trimmedPrompt.length
+      promptLength: trimmedPrompt.length,
+      provider: activeProvider.providerId
     });
 
     let latestSelectionText = selectionText;
@@ -803,10 +700,7 @@ export default function App() {
     });
 
     abortRef.current = controller;
-    liveSinkRef.current = {
-      messageId: assistantMessageId,
-      sink
-    };
+    liveSinkRef.current = { messageId: assistantMessageId, sink };
     shouldStickToBottomRef.current = true;
 
     setMessages((current) => [
@@ -817,7 +711,6 @@ export default function App() {
 
     try {
       let aggregate = "";
-
       for await (const chunk of streamCompletion({
         settings,
         messages: buildMessages({
@@ -834,9 +727,6 @@ export default function App() {
       }
 
       sink.finish();
-      pushDebugLog("info", "wps", "WPS sink finished appending streamed content.", {
-        chars: aggregate.length
-      });
       flushBufferedAssistantMessage(assistantMessageId);
       setMessages((current) =>
         current.map((message) =>
@@ -849,12 +739,10 @@ export default function App() {
     } catch (caught) {
       const aborted =
         caught instanceof DOMException && caught.name === "AbortError";
-
       flushBufferedAssistantMessage(assistantMessageId);
 
       if (aborted) {
         sink.cancel();
-        pushDebugLog("warn", "ui", "Generation aborted by the user.");
         setMessages((current) =>
           current.map((message) =>
             message.id === assistantMessageId
@@ -863,11 +751,9 @@ export default function App() {
           )
         );
       } else {
-        const message = caught instanceof Error ? caught.message : "Generation failed.";
+        const message =
+          caught instanceof Error ? caught.message : "Generation failed.";
         setError(message);
-        pushDebugLog("error", "ui", "Generation ended with an error.", {
-          error: message
-        });
         setMessages((current) =>
           current.map((entry) =>
             entry.id === assistantMessageId
@@ -891,7 +777,6 @@ export default function App() {
           buffer.timerId = null;
         }
       }
-
       abortRef.current = null;
       setIsGenerating(false);
     }
@@ -900,9 +785,7 @@ export default function App() {
   function handlePromptKeyDown(event) {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      if (!isGenerating) {
-        void handleGenerate();
-      }
+      if (!isGenerating) void handleGenerate();
     }
   }
 
@@ -910,56 +793,40 @@ export default function App() {
     handleGenerateRef.current = handleGenerate;
   });
 
+  // -------- Test automation polling (kept) --------
   useEffect(() => {
     let stopped = false;
     let pollTimerId = null;
     let submitTimerId = null;
 
     function schedulePoll(delay = TEST_AUTOMATION_POLL_MS) {
-      if (stopped) {
-        return;
-      }
-
+      if (stopped) return;
       pollTimerId = window.setTimeout(() => {
         void pollTestCommand();
       }, delay);
     }
 
     async function pollTestCommand() {
-      if (stopped) {
-        return;
-      }
-
+      if (stopped) return;
       try {
         const document = readDocumentInfo();
-        const data = await postTestCommandJson("/poll", {
-          document
-        });
+        const data = await postTestCommandJson("/poll", { document });
         const command = data?.command;
-
         if (command?.id && typeof command.prompt === "string") {
           const nextPrompt = command.prompt;
           const visibleDelayMs = normalizeVisibleDelayMs(command.visibleDelayMs);
-
           setPrompt(nextPrompt);
           shouldStickToBottomRef.current = true;
 
           window.requestAnimationFrame(() => {
-            if (stopped) {
-              return;
-            }
-
+            if (stopped) return;
             promptRef.current?.focus();
             acknowledgeTestCommand(command.id, "filled", readDocumentInfo(), {
               promptLength: nextPrompt.length,
               visibleDelayMs
             });
-
             submitTimerId = window.setTimeout(() => {
-              if (stopped) {
-                return;
-              }
-
+              if (stopped) return;
               acknowledgeTestCommand(command.id, "submitted", readDocumentInfo(), {
                 promptLength: nextPrompt.length
               });
@@ -968,7 +835,7 @@ export default function App() {
           });
         }
       } catch {
-        // Browser preview and first-run WPS sessions may not have the relay yet.
+        // Preview may not have the relay.
       } finally {
         schedulePoll();
       }
@@ -978,24 +845,16 @@ export default function App() {
 
     return () => {
       stopped = true;
-      if (pollTimerId !== null) {
-        window.clearTimeout(pollTimerId);
-      }
-      if (submitTimerId !== null) {
-        window.clearTimeout(submitTimerId);
-      }
+      if (pollTimerId !== null) window.clearTimeout(pollTimerId);
+      if (submitTimerId !== null) window.clearTimeout(submitTimerId);
     };
   }, []);
 
   function clearConversation() {
-    if (isGenerating) {
-      return;
-    }
-
+    if (isGenerating) return;
     if (documentInfo?.key) {
       void deleteDocumentSession(documentInfo).catch(() => {});
     }
-
     setMessages([]);
     setError("");
     liveSinkRef.current = null;
@@ -1012,7 +871,6 @@ export default function App() {
       setCopyLogStatus("No logs to copy.");
       return;
     }
-
     try {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(content);
@@ -1027,22 +885,24 @@ export default function App() {
         document.execCommand("copy");
         document.body.removeChild(textarea);
       }
-
       setCopyLogStatus("Logs copied.");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Copy failed.";
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Copy failed.";
       setCopyLogStatus(message);
     }
   }
 
-  const visibleModelCatalog = [...modelCatalog]
-    .sort((left, right) => compareModelEntries(left, right, settings.model))
+  const visibleModelCatalog = [...currentCatalog]
+    .sort((left, right) =>
+      compareModelEntries(
+        left,
+        right,
+        settings.providers[modelLabProvider]?.model || ""
+      )
+    )
     .filter((entry) => {
       const query = modelSearch.trim().toLowerCase();
-      if (!query) {
-        return true;
-      }
-
+      if (!query) return true;
       const haystack = `${entry.id} ${entry.ownedBy}`.toLowerCase();
       return haystack.includes(query);
     });
@@ -1053,22 +913,24 @@ export default function App() {
       ? `${latestDebugLog.scope}: ${latestDebugLog.message}`
       : "";
 
+  const activeProviderMeta = PROVIDERS[activeProviderRecord.providerId];
+  const settingsTabProvider = settings.providers[settingsTab] || {};
+  const settingsTabMeta = PROVIDERS[settingsTab];
+
   return (
     <>
       <main className="minimal-shell">
         <header className="minimal-toolbar">
           <div className="toolbar-group">
-            {settings.providerId === "nvidia" ? (
-              <button
-                className="icon-button"
-                type="button"
-                onClick={openModelLab}
-                aria-label="Model Benchmarks"
-                title="Model Benchmarks"
-              >
-                <Icon name="flask" />
-              </button>
-            ) : null}
+            <button
+              className="icon-button"
+              type="button"
+              onClick={() => openModelLab(settings.activeProvider)}
+              aria-label="Model Benchmarks"
+              title="Model Benchmarks"
+            >
+              <Icon name="flask" />
+            </button>
             <button
               className="icon-button"
               type="button"
@@ -1097,6 +959,12 @@ export default function App() {
             >
               <Icon name="logs" />
             </button>
+          </div>
+          <div className="toolbar-meta" title={activeProviderRecord.model}>
+            <span className="meta-label">{activeProviderMeta.label}</span>
+            <span className="meta-model">
+              {activeProviderRecord.model || "(no model)"}
+            </span>
           </div>
         </header>
 
@@ -1130,7 +998,9 @@ export default function App() {
 
         <footer className="minimal-composer">
           {error ? <div className="tiny-error">{error}</div> : null}
-          {generatingStatus ? <div className="tiny-status">{generatingStatus}</div> : null}
+          {generatingStatus ? (
+            <div className="tiny-status">{generatingStatus}</div>
+          ) : null}
 
           <div className="composer-card">
             <textarea
@@ -1141,7 +1011,6 @@ export default function App() {
               onKeyDown={handlePromptKeyDown}
               placeholder=""
             />
-
             <div className="composer-actions">
               {isGenerating ? (
                 <button
@@ -1172,114 +1041,249 @@ export default function App() {
       {showSettings ? (
         <div className="modal-backdrop" onClick={() => setShowSettings(false)}>
           <section
-            className="modal-card compact"
+            className="modal-card settings-card"
             onClick={(event) => event.stopPropagation()}
           >
-            <header className="modal-toolbar">
-              <div className="modal-icons">
+            <header className="settings-header">
+              <div className="settings-title">
                 <span className="icon-badge">
-                  <Icon name="provider" />
+                  <Icon name="settings" />
                 </span>
+                <div>
+                  <h2>设置</h2>
+                  <p>配置 AI 中转站、模型和代理</p>
+                </div>
               </div>
               <button
                 className="icon-button quiet"
                 type="button"
                 onClick={() => setShowSettings(false)}
-                aria-label="Close Settings"
+                aria-label="Close"
               >
                 <Icon name="close" />
               </button>
             </header>
 
-            <div className="provider-switch">
-              {Object.values(PROVIDERS).map((provider) => (
-                <button
-                  key={provider.id}
-                  type="button"
-                  className={`provider-chip ${
-                    settings.providerId === provider.id ? "active" : ""
-                  }`}
-                  onClick={() => switchProvider(provider.id)}
-                >
-                  {provider.label}
-                </button>
-              ))}
-            </div>
+            <div className="settings-body">
+              <section className="settings-section">
+                <h3 className="section-title">当前使用</h3>
+                <div className="provider-picker">
+                  {Object.values(PROVIDERS).map((provider) => {
+                    const record = settings.providers[provider.id] || {};
+                    const isActive = settings.activeProvider === provider.id;
+                    return (
+                      <button
+                        key={provider.id}
+                        type="button"
+                        className={`provider-card ${isActive ? "active" : ""}`}
+                        onClick={() => selectActiveProvider(provider.id)}
+                      >
+                        <div className="provider-card-title">
+                          <span className="provider-card-name">{provider.label}</span>
+                          {isActive ? (
+                            <span className="provider-card-badge">已选</span>
+                          ) : null}
+                        </div>
+                        <div className="provider-card-model">
+                          {record.model || "未选择模型"}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
 
-            <div className="field-grid">
-              <input
-                type="password"
-                value={settings.apiKey}
-                onChange={(event) => updateSetting("apiKey", event.target.value)}
-                placeholder="API Key"
-              />
-              <input
-                value={settings.model}
-                onChange={(event) => updateSetting("model", event.target.value)}
-                placeholder={placeholderModel(settings.providerId) || "Model Name"}
-              />
-              <input
-                value={settings.baseUrl}
-                onChange={(event) => updateSetting("baseUrl", event.target.value)}
-                placeholder="Base URL"
-              />
-            </div>
+              <section className="settings-section">
+                <div className="settings-tabs">
+                  {Object.values(PROVIDERS).map((provider) => (
+                    <button
+                      key={provider.id}
+                      type="button"
+                      className={`settings-tab ${
+                        settingsTab === provider.id ? "active" : ""
+                      }`}
+                      onClick={() => setSettingsTab(provider.id)}
+                    >
+                      {provider.label}
+                    </button>
+                  ))}
+                </div>
 
-            {settings.providerId === "nvidia" ? (
-              <div className="utility-row">
-                <button
-                  className="secondary-button"
-                  type="button"
-                  onClick={openModelLab}
-                >
-                  <Icon name="flask" />
-                  <span>Model Benchmarks</span>
-                </button>
-              </div>
-            ) : null}
+                <div className="form-group">
+                  <label className="form-label">
+                    <Icon name="link" size={14} />
+                    <span>Base URL</span>
+                  </label>
+                  <input
+                    className="form-input"
+                    value={settingsTabProvider.baseUrl || ""}
+                    onChange={(event) =>
+                      updateProviderSetting(
+                        settingsTab,
+                        "baseUrl",
+                        event.target.value
+                      )
+                    }
+                    placeholder={settingsTabMeta.defaultBaseUrl}
+                  />
+                  <span className="form-hint">
+                    默认：{settingsTabMeta.defaultBaseUrl}
+                  </span>
+                </div>
 
-            <details className="details-panel">
-              <summary>Advanced Settings</summary>
-              <div className="field-grid advanced">
-                <input
-                  type="number"
-                  min="0"
-                  max="2"
-                  step="0.1"
-                  value={settings.temperature}
-                  onChange={(event) =>
-                    updateSetting("temperature", Number(event.target.value || 0))
-                  }
-                  placeholder="Temperature"
-                />
-                <input
-                  type="number"
-                  min="0"
-                  step="1"
-                  value={settings.maxTokens}
-                  onChange={(event) => updateSetting("maxTokens", event.target.value)}
-                  placeholder="Max Output Length (Auto)"
-                />
-                <textarea
-                  rows="4"
-                  value={settings.systemPrompt}
-                  onChange={(event) =>
-                    updateSetting("systemPrompt", event.target.value)
-                  }
-                  placeholder="System Prompt"
-                />
-                <label className="toggle-item">
-                  <span>Use Current Selection as Context</span>
+                <div className="form-group">
+                  <label className="form-label">
+                    <Icon name="key" size={14} />
+                    <span>API Key</span>
+                  </label>
+                  <input
+                    className="form-input"
+                    type="password"
+                    value={settingsTabProvider.apiKey || ""}
+                    onChange={(event) =>
+                      updateProviderSetting(
+                        settingsTab,
+                        "apiKey",
+                        event.target.value
+                      )
+                    }
+                    placeholder={`${settingsTabMeta.label} API Key`}
+                    autoComplete="off"
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">
+                    <Icon name="provider" size={14} />
+                    <span>模型</span>
+                  </label>
+                  <div className="input-with-action">
+                    <input
+                      className="form-input"
+                      value={settingsTabProvider.model || ""}
+                      onChange={(event) =>
+                        updateProviderSetting(
+                          settingsTab,
+                          "model",
+                          event.target.value
+                        )
+                      }
+                      placeholder={
+                        settingsTabMeta.placeholderModel || "模型名称"
+                      }
+                    />
+                    <button
+                      className="inline-button"
+                      type="button"
+                      onClick={() => openModelLab(settingsTab)}
+                    >
+                      <Icon name="flask" size={14} />
+                      <span>浏览</span>
+                    </button>
+                  </div>
+                  <span className="form-hint">
+                    支持从 {settingsTabMeta.label} 获取模型列表
+                  </span>
+                </div>
+              </section>
+
+              <section className="settings-section">
+                <h3 className="section-title">网络与代理</h3>
+                <div className="form-group">
+                  <label className="form-label">
+                    <Icon name="link" size={14} />
+                    <span>HTTP 代理</span>
+                  </label>
+                  <input
+                    className="form-input"
+                    value={settings.proxyUrl || ""}
+                    onChange={(event) =>
+                      updateSetting("proxyUrl", event.target.value)
+                    }
+                    placeholder="留空使用系统代理，例：http://127.0.0.1:7890"
+                  />
+                  <span className="form-hint">
+                    留空自动使用系统代理；设置 URL 后优先使用该代理；设置
+                    <code>direct</code> 可强制直连
+                  </span>
+                </div>
+              </section>
+
+              <details className="settings-section details-panel">
+                <summary>高级选项</summary>
+                <div className="form-group">
+                  <label className="form-label">
+                    <span>Temperature</span>
+                  </label>
+                  <input
+                    className="form-input"
+                    type="number"
+                    min="0"
+                    max="2"
+                    step="0.1"
+                    value={settings.temperature}
+                    onChange={(event) =>
+                      updateSetting(
+                        "temperature",
+                        Number(event.target.value || 0)
+                      )
+                    }
+                  />
+                </div>
+                <div className="form-group">
+                  <label className="form-label">
+                    <span>最大输出长度</span>
+                  </label>
+                  <input
+                    className="form-input"
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={settings.maxTokens}
+                    onChange={(event) =>
+                      updateSetting("maxTokens", event.target.value)
+                    }
+                    placeholder="留空自动"
+                  />
+                </div>
+                <div className="form-group">
+                  <label className="form-label">
+                    <span>System Prompt</span>
+                  </label>
+                  <textarea
+                    className="form-input form-textarea"
+                    rows="4"
+                    value={settings.systemPrompt}
+                    onChange={(event) =>
+                      updateSetting("systemPrompt", event.target.value)
+                    }
+                  />
+                </div>
+                <label className="toggle-row">
+                  <div>
+                    <div className="toggle-title">使用当前选区作为上下文</div>
+                    <div className="toggle-hint">
+                      将 WPS 当前选区一并发送给模型
+                    </div>
+                  </div>
                   <input
                     type="checkbox"
                     checked={settings.useSelectionAsContext}
                     onChange={(event) =>
-                      updateSetting("useSelectionAsContext", event.target.checked)
+                      updateSetting(
+                        "useSelectionAsContext",
+                        event.target.checked
+                      )
                     }
                   />
                 </label>
-                <label className="toggle-item">
-                  <span>Replace Current Selection Directly</span>
+                <label className="toggle-row">
+                  <div>
+                    <div className="toggle-title">直接替换当前选区</div>
+                    <div className="toggle-hint">
+                      输出前先删除当前选区内容
+                    </div>
+                  </div>
                   <input
                     type="checkbox"
                     checked={settings.replaceSelection}
@@ -1288,25 +1292,40 @@ export default function App() {
                     }
                   />
                 </label>
-                {settings.providerId === "openrouter" ? (
+                {settingsTab === "openrouter" ? (
                   <>
-                    <input
-                      value={settings.referer}
-                      onChange={(event) => updateSetting("referer", event.target.value)}
-                      placeholder="Referrer"
-                    />
-                    <input
-                      value={settings.title}
-                      onChange={(event) => updateSetting("title", event.target.value)}
-                      placeholder="Application Title"
-                    />
+                    <div className="form-group">
+                      <label className="form-label">
+                        <span>Referer</span>
+                      </label>
+                      <input
+                        className="form-input"
+                        value={settings.referer}
+                        onChange={(event) =>
+                          updateSetting("referer", event.target.value)
+                        }
+                      />
+                    </div>
+                    <div className="form-group">
+                      <label className="form-label">
+                        <span>应用标题</span>
+                      </label>
+                      <input
+                        className="form-input"
+                        value={settings.title}
+                        onChange={(event) =>
+                          updateSetting("title", event.target.value)
+                        }
+                      />
+                    </div>
                   </>
                 ) : null}
-              </div>
-            </details>
+              </details>
+            </div>
           </section>
         </div>
       ) : null}
+
       {showLogs ? (
         <div className="modal-backdrop" onClick={() => setShowLogs(false)}>
           <section
@@ -1330,17 +1349,27 @@ export default function App() {
             </header>
 
             <div className="log-toolbar">
-              <button className="secondary-button" type="button" onClick={() => void copyLogs()}>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => void copyLogs()}
+              >
                 <Icon name="copy" />
                 <span>Copy Logs</span>
               </button>
-              <button className="secondary-button" type="button" onClick={clearLogs}>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={clearLogs}
+              >
                 <Icon name="trash" />
                 <span>Clear Logs</span>
               </button>
             </div>
 
-            {copyLogStatus ? <div className="tiny-status">{copyLogStatus}</div> : null}
+            {copyLogStatus ? (
+              <div className="tiny-status">{copyLogStatus}</div>
+            ) : null}
 
             <div className="log-list">
               {debugLogs.length === 0 ? (
@@ -1369,6 +1398,7 @@ export default function App() {
           </section>
         </div>
       ) : null}
+
       {showModelLab ? (
         <div className="modal-backdrop" onClick={() => setShowModelLab(false)}>
           <section
@@ -1380,84 +1410,119 @@ export default function App() {
                 <span className="icon-badge">
                   <Icon name="flask" />
                 </span>
+                <div className="model-lab-title">
+                  <span>模型列表</span>
+                </div>
               </div>
               <button
                 className="icon-button quiet"
                 type="button"
                 onClick={() => setShowModelLab(false)}
-                aria-label="Close Model Benchmarks"
+                aria-label="Close"
               >
                 <Icon name="close" />
               </button>
             </header>
+
+            <div className="settings-tabs lab-tabs">
+              {Object.values(PROVIDERS).map((provider) => (
+                <button
+                  key={provider.id}
+                  type="button"
+                  className={`settings-tab ${
+                    modelLabProvider === provider.id ? "active" : ""
+                  }`}
+                  onClick={() => {
+                    setModelLabProvider(provider.id);
+                    setModelSearch("");
+                    setModelLabError("");
+                  }}
+                >
+                  {provider.label}
+                </button>
+              ))}
+            </div>
 
             <div className="lab-toolbar">
               <input
                 className="model-search-input"
                 value={modelSearch}
                 onChange={(event) => setModelSearch(event.target.value)}
-                placeholder="Search Models"
+                placeholder="搜索模型"
               />
-
               <div className="lab-actions">
                 <button
                   className="secondary-button"
                   type="button"
-                  onClick={() => void handleLoadModels()}
+                  onClick={() => void handleLoadModels(modelLabProvider)}
                   disabled={isLoadingModels || isBenchmarkingModels}
                 >
-                  <span>{isLoadingModels ? "Loading..." : "Refresh Models"}</span>
+                  <Icon name="refresh" size={14} />
+                  <span>{isLoadingModels ? "加载中..." : "刷新模型列表"}</span>
                 </button>
-
                 <button
                   className="secondary-button"
                   type="button"
                   onClick={() =>
                     isBenchmarkingModels
                       ? stopBenchmarking()
-                      : void handleBenchmarkModels()
+                      : void handleBenchmarkModels(modelLabProvider)
                   }
-                  disabled={isLoadingModels || modelCatalog.length === 0}
+                  disabled={isLoadingModels || currentCatalog.length === 0}
                 >
+                  <Icon name="flask" size={14} />
                   <span>
                     {isBenchmarkingModels
-                      ? `Stop Benchmark ${benchmarkProgress.completed}/${benchmarkProgress.total}`
-                      : "Start Benchmark"}
+                      ? `停止 ${benchmarkProgress.completed}/${benchmarkProgress.total}`
+                      : "开始基准测试"}
                   </span>
                 </button>
               </div>
             </div>
 
-            {modelLabError ? <div className="tiny-error">{modelLabError}</div> : null}
+            {modelLabError ? (
+              <div className="tiny-error">{modelLabError}</div>
+            ) : null}
 
             <div className="model-list">
-              {visibleModelCatalog.map((entry) => (
-                <article
-                  key={entry.id}
-                  className={`model-row ${settings.model === entry.id ? "active" : ""}`}
-                  title={modelEntryTitle(entry)}
-                >
-                  <div className="model-name">{entry.id}</div>
-
-                  <div className="model-actions">
-                    <span
-                      className={`${benchmarkClassName(entry)} compact`}
-                      title={benchmarkLabel(entry)}
+              {visibleModelCatalog.length === 0 ? (
+                <div className="log-empty">
+                  {isLoadingModels
+                    ? "正在加载模型列表..."
+                    : "暂无模型。请配置 API Key 后刷新。"}
+                </div>
+              ) : (
+                visibleModelCatalog.map((entry) => {
+                  const isCurrent =
+                    settings.providers[modelLabProvider]?.model === entry.id;
+                  return (
+                    <article
+                      key={entry.id}
+                      className={`model-row ${isCurrent ? "active" : ""}`}
+                      title={modelEntryTitle(entry)}
                     >
-                      {benchmarkStatusText(entry)}
-                    </span>
-                    <button
-                      className={`secondary-button slim model-use-button ${
-                        settings.model === entry.id ? "active" : ""
-                      }`}
-                      type="button"
-                      onClick={() => applyModel(entry.id)}
-                    >
-                      <span>{settings.model === entry.id ? "Current" : "Use"}</span>
-                    </button>
-                  </div>
-                </article>
-              ))}
+                      <div className="model-name">{entry.id}</div>
+                      <div className="model-actions">
+                        <span
+                          className={`${benchmarkClassName(entry)} compact`}
+                          title={benchmarkLabel(entry)}
+                        >
+                          {benchmarkStatusText(entry)}
+                        </span>
+                        <button
+                          className={`secondary-button slim model-use-button ${
+                            isCurrent ? "active" : ""
+                          }`}
+                          type="button"
+                          onClick={() => applyModel(entry.id)}
+                        >
+                          <span>{isCurrent ? "当前" : "使用"}</span>
+                        </button>
+                      </div>
+                    </article>
+                  );
+                })
+              )}
             </div>
           </section>
         </div>

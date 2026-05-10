@@ -1,10 +1,8 @@
 import { tryStartLocalRelay } from "../shared/relay";
 import { pushDebugLog } from "./debugLog";
 
-const RELAY_BOOTSTRAP_URL = "http://127.0.0.1:3888/bootstrap";
-const RELAY_NVIDIA_MODELS_URL = "http://127.0.0.1:3888/nvidia/v1/models";
-const RELAY_NVIDIA_BENCHMARK_URL =
-  "http://127.0.0.1:3888/nvidia/v1/models/benchmark";
+const RELAY_BASE_URL = "http://127.0.0.1:3888";
+const RELAY_BOOTSTRAP_URL = `${RELAY_BASE_URL}/bootstrap`;
 const DEFAULT_SELECTION_CONTEXT_LIMIT = 24000;
 const DEFAULT_HISTORY_MESSAGE_LIMIT = 12;
 const DEFAULT_HISTORY_CHAR_LIMIT = 18000;
@@ -14,23 +12,38 @@ export const PROVIDERS = {
     id: "openrouter",
     label: "OpenRouter",
     defaultBaseUrl: "https://openrouter.ai/api/v1",
-    placeholderModel: "openai/gpt-4.1-mini"
+    relayPrefix: `${RELAY_BASE_URL}/openrouter/v1`,
+    placeholderModel: "openai/gpt-4o-mini",
+    recommendedModel: "openai/gpt-4o-mini",
+    requiresApiKey: true
   },
   nvidia: {
     id: "nvidia",
     label: "NVIDIA Build",
-    defaultBaseUrl: "http://127.0.0.1:3888/nvidia/v1",
-    relayBaseUrl: "http://127.0.0.1:3888/nvidia/v1",
+    defaultBaseUrl: "https://integrate.api.nvidia.com/v1",
+    relayPrefix: `${RELAY_BASE_URL}/nvidia/v1`,
     placeholderModel: "deepseek-ai/deepseek-v3.1-terminus",
-    recommendedModel: "deepseek-ai/deepseek-v3.1-terminus"
+    recommendedModel: "deepseek-ai/deepseek-v3.1-terminus",
+    requiresApiKey: true
   }
 };
 
 export const DEFAULT_SETTINGS = {
-  providerId: "nvidia",
-  baseUrl: PROVIDERS.nvidia.relayBaseUrl,
-  apiKey: "",
-  model: PROVIDERS.nvidia.recommendedModel,
+  activeProvider: "nvidia",
+  providers: {
+    openrouter: {
+      baseUrl: PROVIDERS.openrouter.defaultBaseUrl,
+      apiKey: "",
+      model: ""
+    },
+    nvidia: {
+      baseUrl: PROVIDERS.nvidia.defaultBaseUrl,
+      apiKey: "",
+      model: PROVIDERS.nvidia.recommendedModel
+    }
+  },
+  proxyUrl: "",
+  useRelay: true,
   temperature: 0.5,
   maxTokens: "",
   systemPrompt:
@@ -46,12 +59,10 @@ function normalizeMaxTokens(value) {
   if (value === "" || value === null || value === undefined) {
     return "";
   }
-
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) {
     return "";
   }
-
   return String(Math.floor(parsed));
 }
 
@@ -60,25 +71,110 @@ function normalizeFirstTokenTimeout(value) {
   if (!Number.isFinite(parsed) || parsed <= 0) {
     return DEFAULT_SETTINGS.firstTokenTimeoutMs;
   }
-
   return Math.min(Math.floor(parsed), 10 * 60 * 1000);
 }
 
-function isNvidiaRelayMode(settings) {
-  return settings?.providerId === "nvidia";
-}
+function normalizeProviderRecord(providerId, input) {
+  const defaults = DEFAULT_SETTINGS.providers[providerId] || {
+    baseUrl: "",
+    apiKey: "",
+    model: ""
+  };
+  const record = input && typeof input === "object" ? input : {};
 
-function createAuthorizationHeaders(apiKey) {
   return {
-    Authorization: `Bearer ${String(apiKey ?? "").trim()}`
+    baseUrl: String(record.baseUrl ?? "").trim() || defaults.baseUrl,
+    apiKey: String(record.apiKey ?? ""),
+    model: String(record.model ?? "").trim() || defaults.model || ""
   };
 }
 
-function createNvidiaHeaders(apiKey) {
-  return {
-    ...createAuthorizationHeaders(apiKey),
-    "Content-Type": "application/json"
+function migrateLegacySettings(input) {
+  if (!input || typeof input !== "object") {
+    return null;
+  }
+
+  // Detect legacy flat shape: providerId + apiKey + baseUrl + model at root level.
+  if (input.providers || !input.providerId) {
+    return null;
+  }
+
+  const providerId =
+    input.providerId === "openrouter" ? "openrouter" : "nvidia";
+  const base = {
+    ...DEFAULT_SETTINGS,
+    activeProvider: providerId,
+    providers: {
+      ...DEFAULT_SETTINGS.providers,
+      [providerId]: {
+        baseUrl:
+          String(input.baseUrl ?? "").trim() ||
+          PROVIDERS[providerId].defaultBaseUrl,
+        apiKey: String(input.apiKey ?? ""),
+        model: String(input.model ?? "").trim()
+      }
+    },
+    temperature: input.temperature ?? DEFAULT_SETTINGS.temperature,
+    maxTokens: input.maxTokens ?? "",
+    systemPrompt: input.systemPrompt ?? DEFAULT_SETTINGS.systemPrompt,
+    useSelectionAsContext:
+      typeof input.useSelectionAsContext === "boolean"
+        ? input.useSelectionAsContext
+        : DEFAULT_SETTINGS.useSelectionAsContext,
+    replaceSelection:
+      typeof input.replaceSelection === "boolean"
+        ? input.replaceSelection
+        : DEFAULT_SETTINGS.replaceSelection,
+    firstTokenTimeoutMs:
+      input.firstTokenTimeoutMs ?? DEFAULT_SETTINGS.firstTokenTimeoutMs,
+    referer: input.referer ?? DEFAULT_SETTINGS.referer,
+    title: input.title ?? DEFAULT_SETTINGS.title
   };
+
+  return base;
+}
+
+export function normalizeSettings(input) {
+  const migrated = migrateLegacySettings(input) || input || {};
+  const merged = { ...DEFAULT_SETTINGS, ...migrated };
+
+  if (!PROVIDERS[merged.activeProvider]) {
+    merged.activeProvider = DEFAULT_SETTINGS.activeProvider;
+  }
+
+  const providerRecords = {};
+  for (const providerId of Object.keys(PROVIDERS)) {
+    providerRecords[providerId] = normalizeProviderRecord(
+      providerId,
+      merged.providers?.[providerId]
+    );
+  }
+  merged.providers = providerRecords;
+
+  merged.proxyUrl = String(merged.proxyUrl ?? "").trim();
+  merged.useRelay = merged.useRelay !== false;
+  merged.temperature = Number.isFinite(Number(merged.temperature))
+    ? Number(merged.temperature)
+    : DEFAULT_SETTINGS.temperature;
+  merged.maxTokens = normalizeMaxTokens(merged.maxTokens);
+  merged.firstTokenTimeoutMs = normalizeFirstTokenTimeout(
+    merged.firstTokenTimeoutMs
+  );
+  merged.systemPrompt = String(
+    merged.systemPrompt ?? DEFAULT_SETTINGS.systemPrompt
+  );
+  merged.referer = String(merged.referer ?? DEFAULT_SETTINGS.referer);
+  merged.title = String(merged.title ?? DEFAULT_SETTINGS.title);
+  merged.useSelectionAsContext = merged.useSelectionAsContext !== false;
+  merged.replaceSelection = merged.replaceSelection !== false;
+
+  return merged;
+}
+
+export function getActiveProviderRecord(settings) {
+  const providerId = settings?.activeProvider || DEFAULT_SETTINGS.activeProvider;
+  const record = settings?.providers?.[providerId] || {};
+  return { providerId, ...record };
 }
 
 function isFetchTransportError(error) {
@@ -115,18 +211,14 @@ function xhrRequest({
     }
 
     function finishWithError(error) {
-      if (settled) {
-        return;
-      }
+      if (settled) return;
       settled = true;
       cleanup();
       reject(error);
     }
 
     function finishWithValue(value) {
-      if (settled) {
-        return;
-      }
+      if (settled) return;
       settled = true;
       cleanup();
       resolve(value);
@@ -180,7 +272,6 @@ function xhrRequest({
         handleAbort();
         return;
       }
-
       signal.addEventListener("abort", handleAbort, { once: true });
     }
 
@@ -190,7 +281,9 @@ function xhrRequest({
       }
       xhr.send(body);
     } catch (error) {
-      finishWithError(error instanceof Error ? error : new TypeError("Failed to fetch"));
+      finishWithError(
+        error instanceof Error ? error : new TypeError("Failed to fetch")
+      );
     }
   });
 }
@@ -218,55 +311,19 @@ async function requestText(options) {
     if (!isFetchTransportError(error)) {
       throw error;
     }
-
     return xhrRequest(options);
   }
 }
 
 async function requestJson(options) {
-  const response = await requestText({
-    ...options,
-    responseType: "json"
-  });
-
+  const response = await requestText({ ...options, responseType: "json" });
   let json = null;
   try {
     json = response.text ? JSON.parse(response.text) : null;
   } catch {
     json = null;
   }
-
-  return {
-    ...response,
-    json
-  };
-}
-
-export function normalizeSettings(input) {
-  const settings = { ...DEFAULT_SETTINGS, ...input };
-
-  if (!PROVIDERS[settings.providerId]) {
-    settings.providerId = DEFAULT_SETTINGS.providerId;
-  }
-
-  if (!String(settings.baseUrl ?? "").trim()) {
-    settings.baseUrl = PROVIDERS[settings.providerId].defaultBaseUrl;
-  }
-
-  if (settings.providerId === "nvidia") {
-    settings.baseUrl = PROVIDERS.nvidia.relayBaseUrl;
-  }
-
-  if (settings.providerId === "nvidia" && !String(settings.model || "").trim()) {
-    settings.model = PROVIDERS.nvidia.recommendedModel;
-  }
-
-  settings.maxTokens = normalizeMaxTokens(settings.maxTokens);
-  settings.firstTokenTimeoutMs = normalizeFirstTokenTimeout(
-    settings.firstTokenTimeoutMs
-  );
-
-  return settings;
+  return { ...response, json };
 }
 
 export async function loadBootstrapSettings(signal) {
@@ -279,9 +336,8 @@ export async function loadBootstrapSettings(signal) {
     });
 
     if (!response.ok) {
-      pushDebugLog("warn", "bootstrap", "Relay bootstrap request returned a non-success status.", {
-        status: response.status,
-        statusText: response.statusText
+      pushDebugLog("warn", "bootstrap", "Relay bootstrap returned a non-success status.", {
+        status: response.status
       });
       return null;
     }
@@ -306,21 +362,15 @@ function normalizeContent(content) {
   if (typeof content === "string") {
     return content;
   }
-
   if (!Array.isArray(content)) {
     return "";
   }
-
   return content
     .map((item) => {
-      if (typeof item === "string") {
-        return item;
-      }
-
+      if (typeof item === "string") return item;
       if (item && typeof item === "object" && "text" in item) {
         return String(item.text ?? "");
       }
-
       return "";
     })
     .join("");
@@ -328,10 +378,7 @@ function normalizeContent(content) {
 
 function extractChunk(payload) {
   const choice = payload?.choices?.[0];
-  if (!choice) {
-    return "";
-  }
-
+  if (!choice) return "";
   return (
     normalizeContent(choice.delta?.content) ||
     normalizeContent(choice.message?.content) ||
@@ -341,48 +388,74 @@ function extractChunk(payload) {
 
 async function buildError(response) {
   const contentType =
-    response.headers?.get?.("content-type") ?? response.getHeader?.("content-type") ?? "";
-
+    response.headers?.get?.("content-type") ??
+    response.getHeader?.("content-type") ??
+    "";
   try {
     if (contentType.includes("application/json")) {
       const json = response.json ?? JSON.parse(response.text ?? "{}");
       return json?.error?.message || JSON.stringify(json);
     }
-
     return response.text ?? "";
   } catch {
     return `${response.status} ${response.statusText}`;
   }
 }
 
-function createRequestBody(settings, messages, options = {}) {
+function buildChatPayload(settings, messages, options = {}) {
+  const provider = getActiveProviderRecord(settings);
   const payload = {
-    model: settings.model.trim(),
+    model: String(provider.model ?? "").trim(),
     messages,
     temperature: Number(settings.temperature),
     stream: options.stream !== false
   };
-
   if (Number(settings.maxTokens) > 0) {
     payload.max_tokens = Number(settings.maxTokens);
   }
-
   return payload;
 }
 
+function createRelayRequestHeaders(settings, provider, extra = {}) {
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${String(provider.apiKey ?? "").trim()}`,
+    "X-Upstream-Base-Url": String(provider.baseUrl ?? "").trim(),
+    ...extra
+  };
+
+  const proxyUrl = String(settings.proxyUrl ?? "").trim();
+  if (proxyUrl) {
+    headers["X-Upstream-Proxy"] = proxyUrl;
+  } else {
+    headers["X-Upstream-Proxy"] = "__direct__";
+  }
+
+  if (provider.providerId === "openrouter") {
+    headers["HTTP-Referer"] = String(settings.referer ?? "").trim() || "https://localhost";
+    headers["X-Title"] = String(settings.title ?? "").trim() || "WPS AI";
+  }
+
+  return headers;
+}
+
 function createRelayChatFormBody(settings, messages) {
+  const provider = getActiveProviderRecord(settings);
   const params = new URLSearchParams();
-  params.set("apiKey", settings.apiKey.trim());
-  params.set("payload", JSON.stringify(createRequestBody(settings, messages)));
+  params.set("apiKey", String(provider.apiKey ?? "").trim());
+  params.set("baseUrl", String(provider.baseUrl ?? "").trim());
+  params.set("proxyUrl", String(settings.proxyUrl ?? "").trim());
+  params.set("provider", provider.providerId);
+  if (provider.providerId === "openrouter") {
+    params.set("referer", String(settings.referer ?? "").trim() || "https://localhost");
+    params.set("title", String(settings.title ?? "").trim() || "WPS AI");
+  }
+  params.set("payload", JSON.stringify(buildChatPayload(settings, messages)));
   return params.toString();
 }
 
-async function waitForLocalRelay(settings, signal) {
-  if (!isNvidiaRelayMode(settings)) {
-    return true;
-  }
-
-  const healthUrl = "http://127.0.0.1:3888/health";
+async function waitForLocalRelay(signal) {
+  const healthUrl = `${RELAY_BASE_URL}/health`;
   pushDebugLog("info", "relay", "Starting local relay health check.", {
     url: healthUrl
   });
@@ -394,33 +467,26 @@ async function waitForLocalRelay(settings, signal) {
       pushDebugLog("warn", "relay", "Relay health check aborted.");
       return false;
     }
-
     try {
       const response = await requestText({
         url: healthUrl,
         method: "GET",
         signal
       });
-
       if (response.ok) {
         pushDebugLog("info", "relay", "Relay health check succeeded.", {
-          attempt: attempt + 1,
-          status: response.status
+          attempt: attempt + 1
         });
         return true;
       }
-
       lastStatus = `${response.status} ${response.statusText || ""}`.trim();
     } catch {
       // Relay may still be starting.
     }
-
     await new Promise((resolve) => window.setTimeout(resolve, 250));
   }
 
-  pushDebugLog("error", "relay", "Relay health check timed out.", {
-    lastStatus
-  });
+  pushDebugLog("error", "relay", "Relay health check timed out.", { lastStatus });
   return false;
 }
 
@@ -428,22 +494,16 @@ function getSelectionContextLimit(settings) {
   if (Number(settings.maxTokens) > 0) {
     return Math.min(Math.max(Number(settings.maxTokens) * 8, 8000), 48000);
   }
-
-  return settings.providerId === "nvidia"
+  return settings.activeProvider === "nvidia"
     ? DEFAULT_SELECTION_CONTEXT_LIMIT
     : 16000;
 }
 
 function trimSelectionContext(selectionText, settings) {
   const normalized = String(selectionText ?? "").trim();
-  if (!normalized) {
-    return "";
-  }
-
+  if (!normalized) return "";
   const limit = getSelectionContextLimit(settings);
-  if (normalized.length <= limit) {
-    return normalized;
-  }
+  if (normalized.length <= limit) return normalized;
 
   const headLength = Math.max(2000, Math.floor(limit * 0.65));
   const tailLength = Math.max(1200, limit - headLength);
@@ -465,11 +525,7 @@ function parseSseEvent(block) {
     .map((line) => line.slice(5).trim())
     .join("\n")
     .trim();
-
-  if (!data || data === "[DONE]") {
-    return null;
-  }
-
+  if (!data || data === "[DONE]") return null;
   try {
     return JSON.parse(data);
   } catch {
@@ -477,108 +533,122 @@ function parseSseEvent(block) {
   }
 }
 
-function getNvidiaConnectionError(settings) {
-  if (isNvidiaRelayMode(settings)) {
-    return "The local NVIDIA relay is unavailable. Auto-start was attempted, but the relay is still not ready. Check the local Node and PowerShell environment and try again.";
-  }
+function getRelayStartupError() {
+  return "The local relay startup timed out. Start the relay (npm run relay) and try again.";
 }
 
-function getNvidiaRelayStartupError() {
-  return "The local NVIDIA relay startup timed out. Auto-start was attempted, but /health is still not ready.";
+function getConnectionError() {
+  return "The local relay is unavailable. Start the relay (npm run relay) and retry.";
 }
 
-function getNvidiaTimeoutError(settings) {
+function getTimeoutError(settings) {
+  const provider = getActiveProviderRecord(settings);
   const seconds = Math.max(
     1,
     Math.round(Number(settings.firstTokenTimeoutMs || 0) / 1000)
   );
-
-  return `Model ${settings.model.trim() || "deepseek-ai/deepseek-v3.1-terminus"} did not return the first valid output within ${seconds} seconds.`;
+  return `Model ${provider.model || "(unspecified)"} did not return the first valid output within ${seconds} seconds.`;
 }
 
 function createRequestController(signal) {
   const controller = new AbortController();
-
   if (signal) {
     if (signal.aborted) {
       controller.abort();
     } else {
-      signal.addEventListener("abort", () => controller.abort(), {
-        once: true
-      });
+      signal.addEventListener("abort", () => controller.abort(), { once: true });
     }
   }
-
   return controller;
 }
 
 function normalizeModelCatalog(items) {
   const seen = new Set();
-
   return (Array.isArray(items) ? items : [])
     .map((item) => ({
       id: String(item?.id ?? "").trim(),
       ownedBy: String(item?.owned_by ?? item?.ownedBy ?? "").trim()
     }))
     .filter((item) => {
-      if (!item.id || seen.has(item.id)) {
-        return false;
-      }
-
+      if (!item.id || seen.has(item.id)) return false;
       seen.add(item.id);
       return true;
     })
     .sort((left, right) => left.id.localeCompare(right.id));
 }
 
-export async function loadNvidiaModels({ apiKey, settings, signal }) {
-  pushDebugLog("info", "models", "Loading NVIDIA models through the local relay.");
-  const normalizedSettings = normalizeSettings({
-    providerId: "nvidia",
-    baseUrl: settings?.baseUrl || PROVIDERS.nvidia.relayBaseUrl
-  });
-
-  const relayReady = await waitForLocalRelay(normalizedSettings, signal);
-  if (!relayReady && isNvidiaRelayMode(normalizedSettings)) {
-    throw new Error(getNvidiaRelayStartupError());
+/**
+ * Load the list of available models for a given provider. Routes through the
+ * local relay so proxies and streaming transport stay consistent on every OS.
+ */
+export async function loadProviderModels({ settings, providerId, signal }) {
+  const targetProviderId = providerId || settings.activeProvider;
+  const provider = PROVIDERS[targetProviderId];
+  if (!provider) {
+    throw new Error(`Unknown provider: ${targetProviderId}`);
   }
 
+  const providerRecord = {
+    providerId: targetProviderId,
+    ...(settings.providers?.[targetProviderId] || {})
+  };
+
+  pushDebugLog("info", "models", "Loading models through the local relay.", {
+    provider: targetProviderId
+  });
+
+  const relayReady = await waitForLocalRelay(signal);
+  if (!relayReady) {
+    throw new Error(getRelayStartupError());
+  }
+
+  const url = `${provider.relayPrefix}/models`;
   const response = await requestJson({
-    url: RELAY_NVIDIA_MODELS_URL,
+    url,
     method: "GET",
-    headers: createAuthorizationHeaders(apiKey),
+    headers: createRelayRequestHeaders(settings, providerRecord),
     signal
   });
 
   if (!response.ok) {
     pushDebugLog("error", "models", "Model list request failed.", {
-      status: response.status,
-      statusText: response.statusText
+      status: response.status
     });
     throw new Error(await buildError(response));
   }
 
   const payload = response.json;
-  const items = normalizeModelCatalog(payload?.data ?? payload?.models ?? []);
-  pushDebugLog("info", "models", "Model list loaded.", {
-    count: items.length
-  });
+  const items = normalizeModelCatalog(
+    payload?.data ?? payload?.models ?? payload?.items ?? []
+  );
+  pushDebugLog("info", "models", "Model list loaded.", { count: items.length });
   return items;
 }
 
-async function* streamSseViaXhr({ url, headers, body, signal }) {
+// Kept for backwards compatibility with existing callers.
+export async function loadNvidiaModels({ apiKey, settings, signal }) {
+  const merged = normalizeSettings({
+    ...settings,
+    providers: {
+      ...settings?.providers,
+      nvidia: {
+        ...(settings?.providers?.nvidia || {}),
+        apiKey: apiKey ?? settings?.providers?.nvidia?.apiKey ?? ""
+      }
+    }
+  });
+  return loadProviderModels({ settings: merged, providerId: "nvidia", signal });
+}
+
+async function* streamSseViaXhr({ url, headers, body, method = "POST", signal }) {
   let buffer = "";
   let processedLength = 0;
   const queue = [];
   let done = false;
   let failed = null;
   let notify = null;
-  let loggedFirstProgress = false;
-  let loggedFirstEvent = false;
 
-  pushDebugLog("info", "stream", "Opening relay streaming request.", {
-    url
-  });
+  pushDebugLog("info", "stream", "Opening relay streaming request.", { url });
 
   function pushChunk(text) {
     buffer += text;
@@ -586,9 +656,7 @@ async function* streamSseViaXhr({ url, headers, body, signal }) {
     buffer = parts.pop() ?? "";
     for (const part of parts) {
       const payload = parseSseEvent(part);
-      if (payload) {
-        queue.push(payload);
-      }
+      if (payload) queue.push(payload);
     }
     if (notify) {
       notify();
@@ -598,7 +666,7 @@ async function* streamSseViaXhr({ url, headers, body, signal }) {
 
   xhrRequest({
     url,
-    method: "POST",
+    method,
     headers,
     body,
     signal,
@@ -608,25 +676,14 @@ async function* streamSseViaXhr({ url, headers, body, signal }) {
       if (xhr.status && xhr.status >= 400 && !failed) {
         failed = new Error(responseText || `${xhr.status} ${xhr.statusText}`);
       }
-      if (!loggedFirstProgress && processedLength > 0) {
-        loggedFirstProgress = true;
-        pushDebugLog("info", "stream", "Relay returned the first response bytes.", {
-          status: xhr.status || "",
-          bytes: processedLength
-        });
-      }
-      if (next) {
-        pushChunk(next);
-      }
+      if (next) pushChunk(next);
     }
   })
     .then((response) => {
-      pushDebugLog("info", "stream", "Relay streaming request completed.", {
-        status: response.status,
-        bytes: response.text.length
-      });
       if (response.status >= 400) {
-        failed = new Error(response.text || `${response.status} ${response.statusText}`);
+        failed = new Error(
+          response.text || `${response.status} ${response.statusText}`
+        );
       } else if (response.text.length > processedLength) {
         pushChunk(response.text.slice(processedLength));
       }
@@ -656,54 +713,64 @@ async function* streamSseViaXhr({ url, headers, body, signal }) {
       });
       continue;
     }
-
     yield queue.shift();
-    if (!loggedFirstEvent) {
-      loggedFirstEvent = true;
-      pushDebugLog("info", "stream", "Relay produced the first parsed SSE event.");
-    }
   }
 
-  if (failed) {
-    throw failed;
-  }
+  if (failed) throw failed;
 }
 
-export async function* streamNvidiaModelBenchmarks({
-  apiKey,
-  models,
+export async function* streamModelBenchmarks({
   settings,
+  providerId,
+  models,
   signal,
   timeoutMs = 12000,
   concurrency = 6
 }) {
-  const normalizedSettings = normalizeSettings({
-    providerId: "nvidia",
-    baseUrl: settings?.baseUrl || PROVIDERS.nvidia.relayBaseUrl
-  });
-
-  const relayReady = await waitForLocalRelay(normalizedSettings, signal);
-  if (!relayReady) {
-    throw new Error(getNvidiaRelayStartupError());
+  const targetProviderId = providerId || settings.activeProvider;
+  const provider = PROVIDERS[targetProviderId];
+  if (!provider) {
+    throw new Error(`Unknown provider: ${targetProviderId}`);
   }
+
+  const relayReady = await waitForLocalRelay(signal);
+  if (!relayReady) {
+    throw new Error(getRelayStartupError());
+  }
+
+  const providerRecord = {
+    providerId: targetProviderId,
+    ...(settings.providers?.[targetProviderId] || {})
+  };
 
   for await (const payload of streamSseViaXhr({
-    url: RELAY_NVIDIA_BENCHMARK_URL,
-    headers: {
-      ...createAuthorizationHeaders(apiKey),
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      models,
-      timeoutMs,
-      concurrency
-    }),
+    url: `${provider.relayPrefix}/benchmark`,
+    headers: createRelayRequestHeaders(settings, providerRecord),
+    body: JSON.stringify({ models, timeoutMs, concurrency }),
     signal
   })) {
-    if (payload) {
-      yield payload;
-    }
+    if (payload) yield payload;
   }
+}
+
+// Backwards-compatible alias used by existing callers.
+export async function* streamNvidiaModelBenchmarks(options = {}) {
+  const settings = normalizeSettings({
+    ...(options.settings || {}),
+    providers: {
+      ...(options.settings?.providers || {}),
+      nvidia: {
+        ...(options.settings?.providers?.nvidia || {}),
+        apiKey:
+          options.apiKey ?? options.settings?.providers?.nvidia?.apiKey ?? ""
+      }
+    }
+  });
+  yield* streamModelBenchmarks({
+    ...options,
+    settings,
+    providerId: "nvidia"
+  });
 }
 
 export function buildMessages({ prompt, selectionText, settings, history = [] }) {
@@ -733,123 +800,81 @@ export function buildMessages({ prompt, selectionText, settings, history = [] })
           : "";
     const content = String(entry?.content ?? "").trim();
 
-    if (!role || !content || entry?.streaming || entry?.error) {
-      continue;
-    }
+    if (!role || !content || entry?.streaming || entry?.error) continue;
+    if (remainingChars <= 0) break;
 
-    if (remainingChars <= 0) {
-      break;
-    }
-
-    normalizedHistory.unshift({
-      role,
-      content
-    });
+    normalizedHistory.unshift({ role, content });
     remainingChars -= content.length;
 
-    if (normalizedHistory.length >= DEFAULT_HISTORY_MESSAGE_LIMIT) {
-      break;
-    }
+    if (normalizedHistory.length >= DEFAULT_HISTORY_MESSAGE_LIMIT) break;
   }
 
   return [
-    {
-      role: "system",
-      content: settings.systemPrompt.trim()
-    },
+    { role: "system", content: String(settings.systemPrompt ?? "").trim() },
     ...normalizedHistory,
-    {
-      role: "user",
-      content: `${selectionBlock}${prompt.trim()}`
-    }
+    { role: "user", content: `${selectionBlock}${prompt.trim()}` }
   ];
 }
 
 export async function* streamCompletion({ settings, messages, signal }) {
-  const headers = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${settings.apiKey.trim()}`
-  };
-  let requestHeaders = headers;
-  let requestBody = JSON.stringify(createRequestBody(settings, messages));
-
-  if (settings.providerId === "openrouter") {
-    headers["HTTP-Referer"] = settings.referer.trim() || "https://localhost";
-    headers["X-Title"] = settings.title.trim() || "WPS AI";
-  }
-
-  if (settings.providerId === "nvidia") {
-    requestHeaders = {
-      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
-    };
-    requestBody = createRelayChatFormBody(settings, messages);
-    pushDebugLog(
-      "info",
-      "generation",
-      "Using the relay compatibility transport for the local NVIDIA chat request."
-    );
+  const provider = getActiveProviderRecord(settings);
+  const providerMeta = PROVIDERS[provider.providerId];
+  if (!providerMeta) {
+    throw new Error(`Unknown provider: ${provider.providerId}`);
   }
 
   const requestController = createRequestController(signal);
   let timedOutBeforeFirstChunk = false;
   let firstChunkTimeoutId = null;
 
-  if (settings.providerId === "nvidia") {
-    firstChunkTimeoutId = window.setTimeout(() => {
-      timedOutBeforeFirstChunk = true;
-      requestController.abort();
-    }, normalizeFirstTokenTimeout(settings.firstTokenTimeoutMs));
-    pushDebugLog("info", "generation", "Armed the first-token timeout.", {
-      timeoutMs: normalizeFirstTokenTimeout(settings.firstTokenTimeoutMs)
-    });
-  }
+  firstChunkTimeoutId = window.setTimeout(() => {
+    timedOutBeforeFirstChunk = true;
+    requestController.abort();
+  }, normalizeFirstTokenTimeout(settings.firstTokenTimeoutMs));
+
+  pushDebugLog("info", "generation", "Preparing streamed completion.", {
+    provider: provider.providerId,
+    model: provider.model
+  });
 
   try {
-    pushDebugLog("info", "generation", "Preparing streamed completion request.", {
-      provider: settings.providerId,
-      model: settings.model.trim()
-    });
-    const relayReady = await waitForLocalRelay(settings, signal);
-    if (!relayReady && isNvidiaRelayMode(settings)) {
-      throw new Error(getNvidiaRelayStartupError());
+    const relayReady = await waitForLocalRelay(signal);
+    if (!relayReady) {
+      throw new Error(getRelayStartupError());
     }
   } catch (error) {
     if (firstChunkTimeoutId !== null) {
       window.clearTimeout(firstChunkTimeoutId);
     }
-
-    if (timedOutBeforeFirstChunk && settings.providerId === "nvidia") {
-      throw new Error(getNvidiaTimeoutError(settings));
+    if (timedOutBeforeFirstChunk) {
+      throw new Error(getTimeoutError(settings));
     }
-
-    if (error instanceof Error && error.message) {
-      throw error;
-    }
-
-    if (settings.providerId === "nvidia") {
-      throw new Error(getNvidiaConnectionError(settings));
-    }
-
-    throw error;
+    if (error instanceof Error && error.message) throw error;
+    throw new Error(getConnectionError());
   }
+
+  const url = `${providerMeta.relayPrefix}/chat/completions`;
+
+  // Prefer the compatibility form-encoded transport. It has proven most
+  // reliable inside the WPS embedded browser on both Windows and macOS.
+  const requestHeaders = {
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+  };
+  const requestBody = createRelayChatFormBody(settings, messages);
 
   let receivedFirstChunk = false;
   let receivedEvent = false;
   let totalChars = 0;
+
   try {
-    pushDebugLog("info", "generation", "Sending streamed completion request to the relay.", {
-      url: `${settings.baseUrl.replace(/\/+$/, "")}/chat/completions`
-    });
+    pushDebugLog("info", "generation", "Sending streamed completion.", { url });
     for await (const payload of streamSseViaXhr({
-      url: `${settings.baseUrl.replace(/\/+$/, "")}/chat/completions`,
+      url,
       headers: requestHeaders,
       body: requestBody,
       signal: requestController.signal
     })) {
       receivedEvent = true;
-      if (!receivedFirstChunk) {
-        pushDebugLog("info", "generation", "Received the first relay event.");
-      }
 
       if (payload?.error?.message) {
         throw new Error(String(payload.error.message));
@@ -859,9 +884,6 @@ export async function* streamCompletion({ settings, messages, signal }) {
       if (text) {
         if (!receivedFirstChunk) {
           receivedFirstChunk = true;
-          pushDebugLog("info", "generation", "Received the first streamed text chunk.", {
-            length: text.length
-          });
           if (firstChunkTimeoutId !== null) {
             window.clearTimeout(firstChunkTimeoutId);
             firstChunkTimeoutId = null;
@@ -880,28 +902,20 @@ export async function* streamCompletion({ settings, messages, signal }) {
       throw new Error(message);
     }
 
-    pushDebugLog("info", "generation", "Streamed completion finished successfully.", {
+    pushDebugLog("info", "generation", "Streamed completion finished.", {
       totalChars
     });
   } catch (error) {
     if (firstChunkTimeoutId !== null) {
       window.clearTimeout(firstChunkTimeoutId);
     }
-
-    if (timedOutBeforeFirstChunk && settings.providerId === "nvidia") {
-      pushDebugLog("error", "generation", "Timed out before the first text chunk.", {
-        model: settings.model.trim()
-      });
-      throw new Error(getNvidiaTimeoutError(settings));
+    if (timedOutBeforeFirstChunk) {
+      pushDebugLog("error", "generation", "Timed out before first text chunk.");
+      throw new Error(getTimeoutError(settings));
     }
-
     pushDebugLog("error", "generation", "Streamed completion failed.", {
-      error
+      error: error instanceof Error ? error.message : String(error)
     });
-    if (error instanceof Error && error.message) {
-      throw error;
-    }
-
     throw error;
   }
 }

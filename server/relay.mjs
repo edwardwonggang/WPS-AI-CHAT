@@ -9,34 +9,53 @@ import {
   writeFileSync
 } from "node:fs";
 import { createServer } from "node:http";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const PORT = 3888;
-const NVIDIA_CHAT_UPSTREAM = "https://integrate.api.nvidia.com/v1/chat/completions";
-const NVIDIA_MODELS_UPSTREAM = "https://integrate.api.nvidia.com/v1/models";
-const OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
 const CURL_BIN = process.platform === "win32" ? "curl.exe" : "curl";
 const RELAY_CONFIG_URL = new URL("./relay.config.json", import.meta.url);
-const DEFAULT_EXTERNAL_PROXY = "http://proxy.zte.com.cn:80";
 const LOCAL_NO_PROXY = "127.0.0.1,localhost,::1";
 const DEFAULT_BENCHMARK_TIMEOUT_MS = 12000;
 const DEFAULT_BENCHMARK_CONCURRENCY = 6;
+
 const DEFAULT_SESSION_ROOT =
   process.platform === "win32"
-    ? "D:\\Programs\\WPS AI Sessions"
-    : "/tmp/wps-ai-sessions";
+    ? join(process.env.APPDATA || homedir(), "WPS AI", "Sessions")
+    : join(homedir(), ".wps-ai", "sessions");
+
 const SESSION_BLOCK_CLOSE = "<!-- /WPS-AI-MESSAGE -->";
 const BENCHMARK_MESSAGES = [
-  {
-    role: "user",
-    content: "Reply with OK only."
-  }
+  { role: "user", content: "Reply with OK only." }
 ];
+
+// Static provider metadata. Base URLs can be overridden per request via the
+// X-Upstream-Base-Url header or the `baseUrl` form field.
+const PROVIDER_META = {
+  nvidia: {
+    defaultBaseUrl: "https://integrate.api.nvidia.com/v1"
+  },
+  openrouter: {
+    defaultBaseUrl: "https://openrouter.ai/api/v1"
+  }
+};
+
 const DEFAULT_BOOTSTRAP_SETTINGS = Object.freeze({
-  providerId: "nvidia",
-  baseUrl: "http://127.0.0.1:3888/nvidia/v1",
-  apiKey: "",
-  model: "deepseek-ai/deepseek-v3.1-terminus",
+  activeProvider: "nvidia",
+  providers: {
+    nvidia: {
+      baseUrl: PROVIDER_META.nvidia.defaultBaseUrl,
+      apiKey: "",
+      model: "deepseek-ai/deepseek-v3.1-terminus"
+    },
+    openrouter: {
+      baseUrl: PROVIDER_META.openrouter.defaultBaseUrl,
+      apiKey: "",
+      model: ""
+    }
+  },
+  proxyUrl: "",
+  useRelay: true,
   temperature: 0.5,
   maxTokens: "",
   systemPrompt:
@@ -46,25 +65,20 @@ const DEFAULT_BOOTSTRAP_SETTINGS = Object.freeze({
   firstTokenTimeoutMs: 120000
 });
 
+// ============================================================================
+// Config + proxy helpers
+// ============================================================================
+
 function normalizeProxyUrl(value) {
   const trimmed = String(value ?? "").trim();
-  if (!trimmed) {
-    return "";
-  }
-
-  if (/^https?:\/\//i.test(trimmed)) {
-    return trimmed;
-  }
-
+  if (!trimmed) return "";
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
   return `http://${trimmed}`;
 }
 
 function readRelayConfig() {
   try {
-    if (!existsSync(RELAY_CONFIG_URL)) {
-      return {};
-    }
-
+    if (!existsSync(RELAY_CONFIG_URL)) return {};
     return JSON.parse(readFileSync(RELAY_CONFIG_URL, "utf8"));
   } catch {
     return {};
@@ -83,6 +97,7 @@ function resolveConfigProxy(config) {
 }
 
 function resolveWindowsProxy() {
+  if (process.platform !== "win32") return "";
   try {
     const output = execFileSync(
       "reg.exe",
@@ -98,20 +113,11 @@ function resolveWindowsProxy() {
         windowsHide: true
       }
     );
-
     const match = output.match(/ProxyServer\s+REG_\w+\s+(.+)$/im);
-    if (!match) {
-      return "";
-    }
-
+    if (!match) return "";
     const raw = match[1].trim();
-    if (!raw) {
-      return "";
-    }
-
-    if (!raw.includes("=")) {
-      return normalizeProxyUrl(raw);
-    }
+    if (!raw) return "";
+    if (!raw.includes("=")) return normalizeProxyUrl(raw);
 
     const map = Object.fromEntries(
       raw
@@ -123,23 +129,53 @@ function resolveWindowsProxy() {
           return [key.toLowerCase(), normalizeProxyUrl(value)];
         })
     );
-
     return map.https || map.http || Object.values(map)[0] || "";
   } catch {
     return "";
   }
 }
 
-function resolveProxyEnv(config) {
-  const proxy =
+function resolveMacSystemProxy() {
+  if (process.platform !== "darwin") return "";
+  try {
+    const output = execFileSync("scutil", ["--proxy"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    });
+    const httpsEnabled = /HTTPSEnable\s*:\s*1/.test(output);
+    const httpEnabled = /HTTPEnable\s*:\s*1/.test(output);
+    if (httpsEnabled) {
+      const host = output.match(/HTTPSProxy\s*:\s*(\S+)/)?.[1];
+      const port = output.match(/HTTPSPort\s*:\s*(\d+)/)?.[1];
+      if (host && port) return `http://${host}:${port}`;
+    }
+    if (httpEnabled) {
+      const host = output.match(/HTTPProxy\s*:\s*(\S+)/)?.[1];
+      const port = output.match(/HTTPPort\s*:\s*(\d+)/)?.[1];
+      if (host && port) return `http://${host}:${port}`;
+    }
+  } catch {
+    // scutil may be unavailable.
+  }
+  return "";
+}
+
+function resolveSystemProxy(config) {
+  return (
     resolveConfigProxy(config) ||
-    DEFAULT_EXTERNAL_PROXY ||
     process.env.HTTPS_PROXY ||
     process.env.HTTP_PROXY ||
     process.env.https_proxy ||
     process.env.http_proxy ||
-    (process.platform === "win32" ? resolveWindowsProxy() : "");
+    (process.platform === "win32"
+      ? resolveWindowsProxy()
+      : process.platform === "darwin"
+        ? resolveMacSystemProxy()
+        : "")
+  );
+}
 
+function buildEnvWithProxy(proxyUrl) {
   const noProxy = [
     LOCAL_NO_PROXY,
     process.env.NO_PROXY || "",
@@ -148,9 +184,16 @@ function resolveProxyEnv(config) {
     .filter(Boolean)
     .join(",");
 
-  if (!proxy) {
+  const normalized = normalizeProxyUrl(proxyUrl);
+  if (!normalized) {
     return {
       ...process.env,
+      HTTP_PROXY: "",
+      HTTPS_PROXY: "",
+      http_proxy: "",
+      https_proxy: "",
+      ALL_PROXY: "",
+      all_proxy: "",
       NO_PROXY: noProxy,
       no_proxy: noProxy
     };
@@ -158,94 +201,49 @@ function resolveProxyEnv(config) {
 
   return {
     ...process.env,
-    HTTP_PROXY: proxy,
-    HTTPS_PROXY: proxy,
-    http_proxy: proxy,
-    https_proxy: proxy,
+    HTTP_PROXY: normalized,
+    HTTPS_PROXY: normalized,
+    http_proxy: normalized,
+    https_proxy: normalized,
     NO_PROXY: noProxy,
     no_proxy: noProxy
   };
 }
 
-function createDirectEnv(baseEnv) {
-  return {
-    ...baseEnv,
-    HTTP_PROXY: "",
-    HTTPS_PROXY: "",
-    http_proxy: "",
-    https_proxy: "",
-    ALL_PROXY: "",
-    all_proxy: "",
-    NO_PROXY: baseEnv.NO_PROXY || LOCAL_NO_PROXY,
-    no_proxy: baseEnv.no_proxy || LOCAL_NO_PROXY
-  };
-}
-
-function hasProxyConfigured(env) {
-  return Boolean(
-    String(env?.HTTPS_PROXY || env?.HTTP_PROXY || env?.https_proxy || env?.http_proxy || "")
-      .trim()
-  );
-}
-
-function isProxyConnectionFailure(message) {
-  const normalized = String(message || "");
-  return (
-    /proxy/i.test(normalized) ||
-    /failed to connect to 127\.0\.0\.1 port \d+/i.test(normalized) ||
-    /failed to connect to localhost port \d+/i.test(normalized) ||
-    /could not connect to server/i.test(normalized) ||
-    /connection refused/i.test(normalized) ||
-    /proxyconnect/i.test(normalized)
-  );
-}
+// ============================================================================
+// Bootstrap + session helpers
+// ============================================================================
 
 function normalizeBootstrapSettings(config) {
   const defaults =
     config.defaults && typeof config.defaults === "object" ? config.defaults : {};
-  const providerId =
-    String(defaults.providerId ?? "").trim() === "openrouter"
-      ? "openrouter"
-      : "nvidia";
-  const defaultBaseUrl =
-    providerId === "openrouter"
-      ? OPENROUTER_DEFAULT_BASE_URL
-      : DEFAULT_BOOTSTRAP_SETTINGS.baseUrl;
 
-  return {
-    ...DEFAULT_BOOTSTRAP_SETTINGS,
-    ...defaults,
-    providerId,
-    baseUrl:
-      defaults.baseUrl && String(defaults.baseUrl).trim()
-        ? String(defaults.baseUrl).trim()
-        : defaultBaseUrl,
-    apiKey: String(defaults.apiKey ?? ""),
-    model:
-      String(defaults.model ?? "").trim() ||
-      DEFAULT_BOOTSTRAP_SETTINGS.model,
-    temperature: Number.isFinite(Number(defaults.temperature))
-      ? Number(defaults.temperature)
-      : DEFAULT_BOOTSTRAP_SETTINGS.temperature,
-    maxTokens:
-      defaults.maxTokens === "" || defaults.maxTokens === null
-        ? ""
-        : String(defaults.maxTokens ?? ""),
-    systemPrompt:
-      String(defaults.systemPrompt ?? "").trim() ||
-      DEFAULT_BOOTSTRAP_SETTINGS.systemPrompt,
-    useSelectionAsContext:
-      typeof defaults.useSelectionAsContext === "boolean"
-        ? defaults.useSelectionAsContext
-        : DEFAULT_BOOTSTRAP_SETTINGS.useSelectionAsContext,
-    replaceSelection:
-      typeof defaults.replaceSelection === "boolean"
-        ? defaults.replaceSelection
-        : DEFAULT_BOOTSTRAP_SETTINGS.replaceSelection,
-    firstTokenTimeoutMs: Number.isFinite(Number(defaults.firstTokenTimeoutMs))
-      ? Math.min(Math.floor(Number(defaults.firstTokenTimeoutMs)), 10 * 60 * 1000)
-      : DEFAULT_BOOTSTRAP_SETTINGS.firstTokenTimeoutMs
+  const settings = { ...DEFAULT_BOOTSTRAP_SETTINGS, ...defaults };
+  const providers = {
+    ...DEFAULT_BOOTSTRAP_SETTINGS.providers,
+    ...(defaults.providers && typeof defaults.providers === "object"
+      ? defaults.providers
+      : {})
   };
+
+  for (const providerId of Object.keys(DEFAULT_BOOTSTRAP_SETTINGS.providers)) {
+    const record = providers[providerId] || {};
+    providers[providerId] = {
+      baseUrl:
+        String(record.baseUrl ?? "").trim() ||
+        PROVIDER_META[providerId].defaultBaseUrl,
+      apiKey: String(record.apiKey ?? ""),
+      model: String(record.model ?? "").trim()
+    };
+  }
+
+  if (!providers[settings.activeProvider]) {
+    settings.activeProvider = DEFAULT_BOOTSTRAP_SETTINGS.activeProvider;
+  }
+
+  settings.providers = providers;
+  settings.proxyUrl = String(settings.proxyUrl ?? "").trim();
+  return settings;
 }
 
 function normalizeSessionRoot(config) {
@@ -254,19 +252,15 @@ function normalizeSessionRoot(config) {
 }
 
 function normalizeSessionDocument(input) {
-  const title =
-    String(input?.title ?? input?.name ?? "").trim() || "Untitled Document";
+  const title = String(input?.title ?? input?.name ?? "").trim() || "Untitled Document";
   const path = String(input?.path ?? "").trim();
   let fullName = String(input?.fullName ?? "").trim();
-
   if (!fullName && path) {
-    fullName = `${path}${path.endsWith("\\") || path.endsWith("/") ? "" : "\\"}${title}`;
+    fullName = `${path}${path.endsWith("\\") || path.endsWith("/") ? "" : "/"}${title}`;
   }
-
   const key =
     String(input?.key ?? "").trim() ||
     (fullName ? `saved:${fullName.toLowerCase()}` : `unsaved:${title}`);
-
   return {
     key,
     title,
@@ -279,15 +273,15 @@ function normalizeSessionDocument(input) {
 function normalizeSessionMessages(input) {
   return (Array.isArray(input) ? input : [])
     .map((entry, index) => ({
-      id:
-        String(entry?.id ?? "").trim() ||
-        `session-${Date.now()}-${index + 1}`,
+      id: String(entry?.id ?? "").trim() || `session-${Date.now()}-${index + 1}`,
       role: entry?.role === "assistant" ? "assistant" : "user",
       content: String(entry?.content ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n"),
       error: Boolean(entry?.error),
       streaming: false
     }))
-    .filter((entry) => entry.content || entry.role === "assistant" || entry.role === "user");
+    .filter(
+      (entry) => entry.content || entry.role === "assistant" || entry.role === "user"
+    );
 }
 
 function sanitizeSessionFileLabel(value) {
@@ -295,7 +289,6 @@ function sanitizeSessionFileLabel(value) {
     .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-
   return cleaned.slice(0, 80) || "Untitled Document";
 }
 
@@ -308,7 +301,6 @@ function sessionFilePathForDocument(sessionRoot, document) {
     .update(String(document.key ?? ""))
     .digest("hex")
     .slice(0, 12);
-
   return join(sessionRoot, `${sanitizeSessionFileLabel(document.title)}__${hash}.md`);
 }
 
@@ -327,7 +319,6 @@ function serializeSessionMarkdown(document, messages) {
 
   const blocks = messages.map((message) => {
     const body = String(message.content ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-
     return [
       `<!-- WPS-AI-MESSAGE role="${escapeSessionAttribute(message.role)}" id="${escapeSessionAttribute(message.id)}" error="${message.error ? "1" : "0"}" -->`,
       body,
@@ -365,18 +356,17 @@ function parseSessionMarkdown(markdown) {
       streaming: false
     });
   }
-
   return messages;
 }
 
+// ============================================================================
+// HTTP helpers
+// ============================================================================
+
 const RELAY_CONFIG = readRelayConfig();
-const PROXY_ENV = resolveProxyEnv(RELAY_CONFIG);
-const DIRECT_ENV = createDirectEnv(process.env);
+const SYSTEM_PROXY = resolveSystemProxy(RELAY_CONFIG);
 const BOOTSTRAP_SETTINGS = normalizeBootstrapSettings(RELAY_CONFIG);
 const SESSION_ROOT = normalizeSessionRoot(RELAY_CONFIG);
-let pendingTestCommand = null;
-let testCommandSeq = 0;
-const testCommandStatuses = new Map();
 
 function setCorsHeaders(res, req = null) {
   const origin = req?.headers?.origin;
@@ -384,14 +374,17 @@ function setCorsHeaders(res, req = null) {
   const requestPrivateNetwork = req?.headers?.["access-control-request-private-network"];
 
   res.setHeader("Access-Control-Allow-Origin", origin || "*");
-  res.setHeader("Vary", "Origin, Access-Control-Request-Headers, Access-Control-Request-Private-Network");
+  res.setHeader(
+    "Vary",
+    "Origin, Access-Control-Request-Headers, Access-Control-Request-Private-Network"
+  );
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    requestHeaders || "authorization,content-type,accept"
+    requestHeaders ||
+      "authorization,content-type,accept,x-upstream-base-url,x-upstream-proxy,http-referer,x-title"
   );
   res.setHeader("Access-Control-Max-Age", "600");
-
   if (requestPrivateNetwork === "true") {
     res.setHeader("Access-Control-Allow-Private-Network", "true");
   }
@@ -417,280 +410,86 @@ function relayLog(scope, message, details = undefined) {
 
 async function readJsonBody(req) {
   const chunks = [];
-  for await (const chunk of req) {
-    chunks.push(chunk);
-  }
-
+  for await (const chunk of req) chunks.push(chunk);
   const raw = Buffer.concat(chunks).toString("utf8").trim();
-  if (!raw) {
-    return {};
-  }
-
+  if (!raw) return {};
   return JSON.parse(raw);
 }
 
 async function readFormBody(req) {
   const chunks = [];
-  for await (const chunk of req) {
-    chunks.push(chunk);
-  }
-
+  for await (const chunk of req) chunks.push(chunk);
   const raw = Buffer.concat(chunks).toString("utf8").trim();
-  if (!raw) {
-    return {};
-  }
-
+  if (!raw) return {};
   const params = new URLSearchParams(raw);
   return Object.fromEntries(params.entries());
 }
 
-function normalizeTestDocument(document) {
-  if (!document || typeof document !== "object") {
-    return null;
-  }
-
-  return {
-    key: String(document.key ?? ""),
-    title: String(document.title ?? document.name ?? ""),
-    name: String(document.name ?? document.title ?? ""),
-    fullName: String(document.fullName ?? "")
-  };
-}
-
-function rememberTestCommandStatus(id, patch) {
-  if (!id) {
-    return null;
-  }
-
-  const current = testCommandStatuses.get(id) || {
-    id,
-    stage: "queued",
-    updatedAt: new Date().toISOString()
-  };
-  const next = {
-    ...current,
-    ...patch,
-    id,
-    updatedAt: new Date().toISOString()
-  };
-
-  testCommandStatuses.set(id, next);
-
-  if (testCommandStatuses.size > 40) {
-    const oldest = testCommandStatuses.keys().next().value;
-    testCommandStatuses.delete(oldest);
-  }
-
-  return next;
-}
-
-function documentMatchesTestCommand(command, document) {
-  const target = String(command.documentTitle || command.documentKey || "").trim().toLowerCase();
-  if (!target) {
-    return true;
-  }
-
-  const normalized = normalizeTestDocument(document);
-  if (!normalized) {
-    return false;
-  }
-
-  return [normalized.key, normalized.title, normalized.name, normalized.fullName]
-    .filter(Boolean)
-    .some((value) => value.toLowerCase().includes(target));
-}
-
-async function handleTestCommandPush(req, res) {
-  let body;
-  try {
-    body = await readJsonBody(req);
-  } catch {
-    sendJson(res, 400, {
-      error: {
-        message: "Invalid JSON body"
-      }
-    });
-    return;
-  }
-
-  const prompt = String(body?.prompt ?? "");
-  if (!prompt.trim()) {
-    sendJson(res, 400, {
-      error: {
-        message: "Prompt is required"
-      }
-    });
-    return;
-  }
-
-  const id = `test-${Date.now()}-${++testCommandSeq}`;
-  pendingTestCommand = {
-    id,
-    prompt,
-    documentTitle: String(body?.documentTitle ?? ""),
-    documentKey: String(body?.documentKey ?? ""),
-    visibleDelayMs: Math.min(8000, Math.max(600, Number(body?.visibleDelayMs) || 1800)),
-    createdAt: new Date().toISOString()
-  };
-
-  rememberTestCommandStatus(id, {
-    stage: "queued",
-    command: {
-      id,
-      documentTitle: pendingTestCommand.documentTitle,
-      documentKey: pendingTestCommand.documentKey,
-      promptLength: prompt.length,
-      visibleDelayMs: pendingTestCommand.visibleDelayMs
-    }
-  });
-
-  sendJson(res, 200, {
-    ok: true,
-    id,
-    stage: "queued"
-  });
-}
-
-async function handleTestCommandPoll(req, res) {
-  let body;
-  try {
-    body = await readJsonBody(req);
-  } catch {
-    sendJson(res, 400, {
-      error: {
-        message: "Invalid JSON body"
-      }
-    });
-    return;
-  }
-
-  if (!pendingTestCommand) {
-    sendJson(res, 200, {
-      ok: true,
-      command: null
-    });
-    return;
-  }
-
-  if (!documentMatchesTestCommand(pendingTestCommand, body?.document)) {
-    sendJson(res, 200, {
-      ok: true,
-      command: null
-    });
-    return;
-  }
-
-  const command = pendingTestCommand;
-  pendingTestCommand = null;
-  rememberTestCommandStatus(command.id, {
-    stage: "delivered",
-    document: normalizeTestDocument(body?.document)
-  });
-
-  sendJson(res, 200, {
-    ok: true,
-    command
-  });
-}
-
-async function handleTestCommandAck(req, res) {
-  let body;
-  try {
-    body = await readJsonBody(req);
-  } catch {
-    sendJson(res, 400, {
-      error: {
-        message: "Invalid JSON body"
-      }
-    });
-    return;
-  }
-
-  const id = String(body?.id ?? "");
-  if (!id) {
-    sendJson(res, 400, {
-      error: {
-        message: "Command id is required"
-      }
-    });
-    return;
-  }
-
-  const status = rememberTestCommandStatus(id, {
-    stage: String(body?.stage ?? "ack"),
-    document: normalizeTestDocument(body?.document),
-    detail: body?.detail || {}
-  });
-
-  sendJson(res, 200, {
-    ok: true,
-    status
-  });
-}
-
-function handleTestCommandStatus(res, requestUrl) {
-  const id = String(requestUrl.searchParams.get("id") ?? "");
-  if (!id) {
-    sendJson(res, 400, {
-      error: {
-        message: "Command id is required"
-      }
-    });
-    return;
-  }
-
-  sendJson(res, 200, {
-    ok: true,
-    status: testCommandStatuses.get(id) || null
-  });
-}
-
 function resolveRelayAuthorization(req, body = null) {
   const headerValue = String(req.headers.authorization || "").trim();
-  if (headerValue) {
-    return headerValue;
-  }
-
+  if (headerValue) return headerValue;
   const apiKey = String(body?.apiKey ?? "").trim();
-  if (!apiKey) {
-    return "";
-  }
-
-  if (/^Bearer\s+/i.test(apiKey)) {
-    return apiKey;
-  }
-
+  if (!apiKey) return "";
+  if (/^Bearer\s+/i.test(apiKey)) return apiKey;
   return `Bearer ${apiKey}`;
 }
 
-function formatCurlFailure(stderr) {
-  const message = stderr.trim();
-  if (!message) {
-    return "Failed to reach NVIDIA upstream";
-  }
+function resolveUpstreamBaseUrl(req, providerId, body = null) {
+  const headerValue = String(req.headers["x-upstream-base-url"] || "").trim();
+  if (headerValue) return headerValue.replace(/\/+$/, "");
+  const bodyValue = String(body?.baseUrl ?? "").trim();
+  if (bodyValue) return bodyValue.replace(/\/+$/, "");
+  return PROVIDER_META[providerId].defaultBaseUrl;
+}
 
+/**
+ * Resolve which proxy to use for this request.
+ * Header `X-Upstream-Proxy` overrides the system proxy:
+ *   - `__direct__` → force direct (ignore system proxy)
+ *   - any URL → use this proxy
+ *   - empty → use system/config proxy
+ */
+function resolveUpstreamProxy(req, body = null) {
+  const headerValue = String(req.headers["x-upstream-proxy"] || "").trim();
+  const bodyValue = body ? String(body.proxyUrl ?? "").trim() : "";
+  const requested = headerValue || bodyValue;
+
+  if (requested === "__direct__") return "";
+  if (requested) return normalizeProxyUrl(requested);
+  return SYSTEM_PROXY || "";
+}
+
+function formatCurlFailure(stderr) {
+  const message = String(stderr || "").trim();
+  if (!message) return "Failed to reach upstream.";
   return message.replace(/^curl:\s*/i, "");
 }
 
+function isProxyConnectionFailure(message) {
+  const normalized = String(message || "");
+  return (
+    /proxy/i.test(normalized) ||
+    /failed to connect to 127\.0\.0\.1 port \d+/i.test(normalized) ||
+    /failed to connect to localhost port \d+/i.test(normalized) ||
+    /could not connect to server/i.test(normalized) ||
+    /connection refused/i.test(normalized) ||
+    /proxyconnect/i.test(normalized)
+  );
+}
+
+// ============================================================================
+// SSE parsing
+// ============================================================================
+
 function normalizeContent(content) {
-  if (typeof content === "string") {
-    return content;
-  }
-
-  if (!Array.isArray(content)) {
-    return "";
-  }
-
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
   return content
     .map((item) => {
-      if (typeof item === "string") {
-        return item;
-      }
-
+      if (typeof item === "string") return item;
       if (item && typeof item === "object" && "text" in item) {
         return String(item.text ?? "");
       }
-
       return "";
     })
     .join("");
@@ -698,10 +497,7 @@ function normalizeContent(content) {
 
 function extractChunk(payload) {
   const choice = payload?.choices?.[0];
-  if (!choice) {
-    return "";
-  }
-
+  if (!choice) return "";
   return (
     normalizeContent(choice.delta?.content) ||
     normalizeContent(choice.message?.content) ||
@@ -716,17 +512,17 @@ function parseSseEvent(block) {
     .map((line) => line.slice(5).trim())
     .join("\n")
     .trim();
-
-  if (!data || data === "[DONE]") {
-    return null;
-  }
-
+  if (!data || data === "[DONE]") return null;
   try {
     return JSON.parse(data);
   } catch {
     return null;
   }
 }
+
+// ============================================================================
+// Curl wrappers
+// ============================================================================
 
 function createCurlArgs({
   authorization,
@@ -737,27 +533,31 @@ function createCurlArgs({
   stream = false
 }) {
   const args = ["-sS"];
-
-  if (stream) {
-    args.push("-N");
-  }
-
+  if (stream) args.push("-N");
   args.push("-f", "-X", method);
-
-  if (authorization) {
-    args.push("-H", `Authorization: ${authorization}`);
-  }
-
+  if (authorization) args.push("-H", `Authorization: ${authorization}`);
   for (const header of headers) {
     args.push("-H", header);
   }
-
-  if (dataFromStdin) {
-    args.push("--data-binary", "@-");
-  }
-
+  if (dataFromStdin) args.push("--data-binary", "@-");
   args.push(url);
   return args;
+}
+
+function buildAttemptEnvs(preferredProxy) {
+  const attempts = [];
+  const normalizedPreferred = normalizeProxyUrl(preferredProxy);
+  if (normalizedPreferred) {
+    attempts.push({
+      label: "proxy",
+      env: buildEnvWithProxy(normalizedPreferred)
+    });
+  }
+  attempts.push({
+    label: "direct",
+    env: buildEnvWithProxy("")
+  });
+  return attempts;
 }
 
 function runCurlBuffered({
@@ -765,17 +565,13 @@ function runCurlBuffered({
   url,
   method = "GET",
   headers = [],
-  body = ""
+  body = "",
+  preferredProxy = ""
 }) {
-  const attempts = hasProxyConfigured(PROXY_ENV)
-    ? [
-        { env: PROXY_ENV, label: "proxy" },
-        { env: DIRECT_ENV, label: "direct" }
-      ]
-    : [{ env: PROXY_ENV, label: "direct" }];
+  const attempts = buildAttemptEnvs(preferredProxy);
 
   function runAttempt(index) {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolvePromise, reject) => {
       const attempt = attempts[index];
       const curl = spawn(
         CURL_BIN,
@@ -797,7 +593,7 @@ function runCurlBuffered({
       let stderr = "";
 
       curl.on("error", (error) => {
-        reject(error instanceof Error ? error : new Error("Failed to start curl"));
+        reject(error instanceof Error ? error : new Error("Failed to start curl."));
       });
 
       curl.stdout.on("data", (chunk) => {
@@ -810,7 +606,7 @@ function runCurlBuffered({
 
       curl.on("close", (code) => {
         if (code === 0) {
-          resolve(stdout);
+          resolvePromise(stdout);
           return;
         }
 
@@ -820,14 +616,13 @@ function runCurlBuffered({
           index + 1 < attempts.length &&
           isProxyConnectionFailure(message)
         ) {
-          relayLog("proxy", "Proxy attempt failed for a buffered NVIDIA request. Retrying direct.", {
+          relayLog("proxy", "Proxy attempt failed, retrying direct.", {
             url,
             message
           });
-          resolve(runAttempt(index + 1));
+          resolvePromise(runAttempt(index + 1));
           return;
         }
-
         reject(new Error(message));
       });
 
@@ -835,7 +630,6 @@ function runCurlBuffered({
         curl.stdin.end();
         return;
       }
-
       curl.stdin.end(body);
     });
   }
@@ -843,36 +637,71 @@ function runCurlBuffered({
   return runAttempt(0);
 }
 
-async function listNvidiaModels(authorization) {
+async function listProviderModels({
+  providerId,
+  authorization,
+  baseUrl,
+  preferredProxy,
+  extraHeaders = []
+}) {
+  const url = `${baseUrl.replace(/\/+$/, "")}/models`;
   const raw = await runCurlBuffered({
     authorization,
-    url: NVIDIA_MODELS_UPSTREAM,
+    url,
     method: "GET",
-    headers: ["Accept: application/json"]
+    headers: ["Accept: application/json", ...extraHeaders],
+    preferredProxy
   });
 
   const json = JSON.parse(raw);
   const seen = new Set();
-  const data = (Array.isArray(json?.data) ? json.data : [])
+  const list = Array.isArray(json?.data)
+    ? json.data
+    : Array.isArray(json?.models)
+      ? json.models
+      : [];
+
+  const data = list
     .map((item) => ({
       id: String(item?.id ?? "").trim(),
       object: String(item?.object ?? "model"),
-      owned_by: String(item?.owned_by ?? "").trim()
+      owned_by: String(item?.owned_by ?? item?.ownedBy ?? "").trim()
     }))
     .filter((item) => {
-      if (!item.id || seen.has(item.id)) {
-        return false;
-      }
-
+      if (!item.id || seen.has(item.id)) return false;
       seen.add(item.id);
       return true;
     })
     .sort((left, right) => left.id.localeCompare(right.id));
 
-  return {
-    object: "list",
-    data
-  };
+  return { object: "list", data };
+}
+
+function buildProviderExtraHeaders(providerId, req, body = null) {
+  if (providerId !== "openrouter") return [];
+  const referer =
+    String(req.headers["http-referer"] || "").trim() ||
+    String(body?.referer ?? "").trim() ||
+    "https://localhost";
+  const title =
+    String(req.headers["x-title"] || "").trim() ||
+    String(body?.title ?? "").trim() ||
+    "WPS AI";
+  return [`HTTP-Referer: ${referer}`, `X-Title: ${title}`];
+}
+
+function classifyBenchmarkFailure(stderr) {
+  const message = String(stderr || "");
+  if (/operation timed out/i.test(message)) {
+    return { status: "timeout", message: "Timed out before first content token." };
+  }
+  if (/(400|404|415|422)/.test(message)) {
+    return { status: "unsupported", message: "This model did not accept chat/completions." };
+  }
+  if (/(401|403)/.test(message)) {
+    return { status: "unauthorized", message: "The current key cannot access this model." };
+  }
+  return { status: "error", message: formatCurlFailure(message) };
 }
 
 function createBenchmarkBody(model) {
@@ -885,38 +714,15 @@ function createBenchmarkBody(model) {
   });
 }
 
-function classifyBenchmarkFailure(stderr) {
-  const message = String(stderr || "");
-
-  if (/operation timed out/i.test(message)) {
-    return {
-      status: "timeout",
-      message: "Timed out before first content token."
-    };
-  }
-
-  if (/(400|404|415|422)/.test(message)) {
-    return {
-      status: "unsupported",
-      message: "This model did not accept chat/completions."
-    };
-  }
-
-  if (/(401|403)/.test(message)) {
-    return {
-      status: "unauthorized",
-      message: "The current key cannot access this model."
-    };
-  }
-
-  return {
-    status: "error",
-    message: formatCurlFailure(message)
-  };
-}
-
-function benchmarkModel(authorization, model, timeoutMs) {
-  return new Promise((resolve) => {
+function benchmarkModel({
+  authorization,
+  baseUrl,
+  model,
+  timeoutMs,
+  preferredProxy,
+  extraHeaders = []
+}) {
+  return new Promise((resolvePromise) => {
     const startedAt = Date.now();
     let buffer = "";
     let firstByteMs = null;
@@ -924,35 +730,24 @@ function benchmarkModel(authorization, model, timeoutMs) {
     let settled = false;
     let activeCurl = null;
 
-    const attempts = hasProxyConfigured(PROXY_ENV)
-      ? [
-          { env: PROXY_ENV, label: "proxy" },
-          { env: DIRECT_ENV, label: "direct" }
-        ]
-      : [{ env: PROXY_ENV, label: "direct" }];
+    const attempts = buildAttemptEnvs(preferredProxy);
 
     function finalize(status, message) {
-      if (settled) {
-        return;
-      }
-
+      if (settled) return;
       settled = true;
       clearTimeout(timeoutId);
-
       try {
         activeCurl?.kill();
       } catch {
-        // Ignore kill failures after process exit.
+        // Ignore.
       }
-
-      resolve({
+      resolvePromise({
         model,
         ok: status === "ok",
         status,
         firstByteMs,
         firstTokenMs,
-        totalMs:
-          firstTokenMs !== null ? firstTokenMs : Math.max(0, Date.now() - startedAt),
+        totalMs: firstTokenMs !== null ? firstTokenMs : Math.max(0, Date.now() - startedAt),
         message: message || ""
       });
     }
@@ -970,9 +765,9 @@ function benchmarkModel(authorization, model, timeoutMs) {
         CURL_BIN,
         createCurlArgs({
           authorization,
-          url: NVIDIA_CHAT_UPSTREAM,
+          url: `${baseUrl.replace(/\/+$/, "")}/chat/completions`,
           method: "POST",
-          headers: ["Content-Type: application/json"],
+          headers: ["Content-Type: application/json", ...extraHeaders],
           dataFromStdin: true,
           stream: true
         }),
@@ -995,15 +790,12 @@ function benchmarkModel(authorization, model, timeoutMs) {
         if (firstByteMs === null) {
           firstByteMs = Math.max(0, Date.now() - startedAt);
         }
-
         buffer += chunk.toString("utf8");
         const parts = buffer.split(/\r?\n\r?\n/);
         buffer = parts.pop() ?? "";
-
         for (const part of parts) {
           const payload = parseSseEvent(part);
           const text = extractChunk(payload);
-
           if (text && firstTokenMs === null) {
             firstTokenMs = Math.max(0, Date.now() - startedAt);
             finalize("ok", "");
@@ -1013,13 +805,8 @@ function benchmarkModel(authorization, model, timeoutMs) {
       });
 
       activeCurl.on("close", () => {
-        if (settled) {
-          return;
-        }
-
-        if (attemptCompleted) {
-          return;
-        }
+        if (settled) return;
+        if (attemptCompleted) return;
         attemptCompleted = true;
 
         if (firstTokenMs !== null) {
@@ -1034,7 +821,7 @@ function benchmarkModel(authorization, model, timeoutMs) {
           firstByteMs === null &&
           isProxyConnectionFailure(failure.message)
         ) {
-          relayLog("proxy", "Proxy attempt failed during model benchmark. Retrying direct.", {
+          relayLog("proxy", "Proxy attempt failed during benchmark, retrying direct.", {
             model,
             message: failure.message
           });
@@ -1052,34 +839,56 @@ function benchmarkModel(authorization, model, timeoutMs) {
   });
 }
 
-async function handleNvidiaModels(req, res) {
-  const authorization = req.headers.authorization;
+// ============================================================================
+// Handlers
+// ============================================================================
+
+async function handleListModels(req, res, providerId) {
+  let body = {};
+  if (req.method === "POST") {
+    try {
+      const contentType = String(req.headers["content-type"] || "").toLowerCase();
+      body = contentType.includes("application/x-www-form-urlencoded")
+        ? await readFormBody(req)
+        : await readJsonBody(req);
+    } catch {
+      sendJson(res, 400, { error: { message: "Invalid request body" } });
+      return;
+    }
+  }
+
+  const authorization = resolveRelayAuthorization(req, body);
   if (!authorization) {
-    sendJson(res, 400, {
-      error: {
-        message: "Missing Authorization header"
-      }
-    });
+    sendJson(res, 400, { error: { message: "Missing API key" } });
     return;
   }
 
+  const baseUrl = resolveUpstreamBaseUrl(req, providerId, body);
+  const preferredProxy = resolveUpstreamProxy(req, body);
+  const extraHeaders = buildProviderExtraHeaders(providerId, req, body);
+
   try {
-    const models = await listNvidiaModels(authorization);
+    const models = await listProviderModels({
+      providerId,
+      authorization,
+      baseUrl,
+      preferredProxy,
+      extraHeaders
+    });
     sendJson(res, 200, models);
   } catch (error) {
     sendJson(res, 502, {
       error: {
-        message:
-          error instanceof Error ? error.message : "Failed to load NVIDIA models"
+        message: error instanceof Error ? error.message : "Failed to load models."
       }
     });
   }
 }
 
-async function handleNvidiaChat(req, res) {
-  relayLog("chat", "Incoming NVIDIA chat request.", {
-    contentType: String(req.headers["content-type"] || ""),
-    hasAuthorizationHeader: Boolean(req.headers.authorization)
+async function handleChatCompletions(req, res, providerId) {
+  relayLog("chat", "Incoming chat request.", {
+    provider: providerId,
+    contentType: String(req.headers["content-type"] || "")
   });
 
   let body;
@@ -1089,73 +898,46 @@ async function handleNvidiaChat(req, res) {
       ? await readFormBody(req)
       : await readJsonBody(req);
   } catch {
-    sendJson(res, 400, {
-      error: {
-        message: "Invalid request body"
-      }
-    });
+    sendJson(res, 400, { error: { message: "Invalid request body" } });
     return;
   }
 
   const authorization = resolveRelayAuthorization(req, body);
   if (!authorization) {
-    relayLog("chat", "Rejected chat request because the API key was missing.");
-    sendJson(res, 400, {
-      error: {
-        message: "Missing API key"
-      }
-    });
+    sendJson(res, 400, { error: { message: "Missing API key" } });
     return;
   }
 
+  let payloadBody = body;
   if (typeof body?.payload === "string" && body.payload.trim()) {
     try {
-      body = JSON.parse(body.payload);
+      payloadBody = JSON.parse(body.payload);
     } catch {
-      relayLog("chat", "Rejected chat request because the compatibility payload was invalid.");
-      sendJson(res, 400, {
-        error: {
-          message: "Invalid payload"
-        }
-      });
+      sendJson(res, 400, { error: { message: "Invalid payload" } });
       return;
     }
   }
+
+  const baseUrl = resolveUpstreamBaseUrl(req, providerId, body);
+  const preferredProxy = resolveUpstreamProxy(req, body);
+  const extraHeaders = buildProviderExtraHeaders(providerId, req, body);
+
+  const upstreamUrl = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
 
   let streamStarted = false;
   let upstreamDataReceived = false;
   let finished = false;
   let activeCurl = null;
-
-  const attempts = hasProxyConfigured(PROXY_ENV)
-    ? [
-        { env: PROXY_ENV, label: "proxy" },
-        { env: DIRECT_ENV, label: "direct" }
-      ]
-    : [{ env: PROXY_ENV, label: "direct" }];
+  const attempts = buildAttemptEnvs(preferredProxy);
 
   function fail(message) {
-    if (finished) {
-      return;
-    }
-
+    if (finished) return;
     finished = true;
     if (!res.headersSent) {
-      relayLog("chat", "Returning buffered relay failure before the SSE stream started.", {
-        message
-      });
       sendJson(res, 502, { error: { message } });
       return;
     }
-
-    relayLog("chat", "Forwarding relay failure through SSE.", {
-      message
-    });
-    sendSse(res, {
-      error: {
-        message
-      }
-    });
+    sendSse(res, { error: { message } });
     res.end();
   }
 
@@ -1168,9 +950,9 @@ async function handleNvidiaChat(req, res) {
       CURL_BIN,
       createCurlArgs({
         authorization,
-        url: NVIDIA_CHAT_UPSTREAM,
+        url: upstreamUrl,
         method: "POST",
-        headers: ["Content-Type: application/json"],
+        headers: ["Content-Type: application/json", ...extraHeaders],
         dataFromStdin: true,
         stream: true
       }),
@@ -1190,64 +972,40 @@ async function handleNvidiaChat(req, res) {
     });
 
     activeCurl.stdout.on("data", (chunk) => {
-      if (finished) {
-        return;
-      }
-
-      if (!streamStarted) {
-        streamStarted = true;
-      }
-
+      if (finished) return;
+      if (!streamStarted) streamStarted = true;
       upstreamDataReceived = true;
       res.write(chunk);
     });
 
     activeCurl.stdout.on("end", () => {
-      if (finished) {
-        return;
-      }
-
-      if (attemptCompleted) {
-        return;
-      }
+      if (finished || attemptCompleted) return;
       attemptCompleted = true;
-
       if (!upstreamDataReceived) {
-        const message = formatCurlFailure(stderr || "NVIDIA upstream closed without any output.");
+        const message = formatCurlFailure(stderr || "Upstream closed with no output.");
         if (
           attempt.label === "proxy" &&
           index + 1 < attempts.length &&
           isProxyConnectionFailure(message)
         ) {
-          relayLog("proxy", "Proxy attempt failed during NVIDIA chat streaming. Retrying direct.", {
-            model: String(body?.model || ""),
+          relayLog("proxy", "Proxy attempt failed during streaming, retrying direct.", {
+            provider: providerId,
+            model: String(payloadBody?.model || ""),
             message
           });
           startAttempt(index + 1);
           return;
         }
-
         fail(message);
         return;
       }
-
-      relayLog("chat", "Completed NVIDIA chat stream.", {
-        stderr: stderr.trim()
-      });
       finished = true;
       res.end();
     });
 
     activeCurl.on("close", (code) => {
-      if (finished) {
-        return;
-      }
-
-      if (attemptCompleted) {
-        return;
-      }
+      if (finished || attemptCompleted) return;
       attemptCompleted = true;
-
       if (!upstreamDataReceived) {
         const message = formatCurlFailure(stderr || `curl exited with code ${code ?? "unknown"}`);
         if (
@@ -1255,29 +1013,21 @@ async function handleNvidiaChat(req, res) {
           index + 1 < attempts.length &&
           isProxyConnectionFailure(message)
         ) {
-          relayLog("proxy", "Proxy attempt closed before any NVIDIA chat data. Retrying direct.", {
-            model: String(body?.model || ""),
-            message
-          });
           startAttempt(index + 1);
           return;
         }
-
         fail(message);
         return;
       }
-
       finished = true;
       res.end();
     });
 
-    activeCurl.stdin.end(JSON.stringify(body));
+    activeCurl.stdin.end(JSON.stringify(payloadBody));
   }
 
   req.on("aborted", () => {
-    if (!finished) {
-      activeCurl?.kill();
-    }
+    if (!finished) activeCurl?.kill();
   });
 
   setCorsHeaders(res, req);
@@ -1290,34 +1040,27 @@ async function handleNvidiaChat(req, res) {
   res.write(": stream-open\n\n");
   streamStarted = true;
 
-  relayLog("chat", "Opened SSE stream to the WPS taskpane.", {
-    model: String(body?.model || "")
-  });
   startAttempt(0);
 }
 
-async function handleNvidiaBenchmark(req, res) {
-  const authorization = req.headers.authorization;
-  if (!authorization) {
-    sendJson(res, 400, {
-      error: {
-        message: "Missing Authorization header"
-      }
-    });
-    return;
-  }
-
+async function handleBenchmark(req, res, providerId) {
   let body;
   try {
     body = await readJsonBody(req);
   } catch {
-    sendJson(res, 400, {
-      error: {
-        message: "Invalid JSON body"
-      }
-    });
+    sendJson(res, 400, { error: { message: "Invalid JSON body" } });
     return;
   }
+
+  const authorization = resolveRelayAuthorization(req, body);
+  if (!authorization) {
+    sendJson(res, 400, { error: { message: "Missing API key" } });
+    return;
+  }
+
+  const baseUrl = resolveUpstreamBaseUrl(req, providerId, body);
+  const preferredProxy = resolveUpstreamProxy(req, body);
+  const extraHeaders = buildProviderExtraHeaders(providerId, req, body);
 
   const models = Array.from(
     new Set(
@@ -1326,13 +1069,8 @@ async function handleNvidiaBenchmark(req, res) {
         .filter(Boolean)
     )
   );
-
   if (models.length === 0) {
-    sendJson(res, 400, {
-      error: {
-        message: "No models provided"
-      }
-    });
+    sendJson(res, 400, { error: { message: "No models provided" } });
     return;
   }
 
@@ -1362,33 +1100,22 @@ async function handleNvidiaBenchmark(req, res) {
     responseClosed = true;
   });
 
-  sendSse(res, {
-    type: "start",
-    total: models.length,
-    timeoutMs,
-    concurrency
-  });
+  sendSse(res, { type: "start", total: models.length, timeoutMs, concurrency });
 
-  await new Promise((resolve) => {
+  await new Promise((resolvePromise) => {
     function flushDone() {
       if (responseClosed) {
-        resolve();
+        resolvePromise();
         return;
       }
-
-      sendSse(res, {
-        type: "done",
-        total: models.length,
-        completed,
-        results
-      });
+      sendSse(res, { type: "done", total: models.length, completed, results });
       res.end();
-      resolve();
+      resolvePromise();
     }
 
     function launchNext() {
       if (responseClosed) {
-        resolve();
+        resolvePromise();
         return;
       }
 
@@ -1397,11 +1124,17 @@ async function handleNvidiaBenchmark(req, res) {
         cursor += 1;
         active += 1;
 
-        benchmarkModel(authorization, model, timeoutMs)
+        benchmarkModel({
+          authorization,
+          baseUrl,
+          model,
+          timeoutMs,
+          preferredProxy,
+          extraHeaders
+        })
           .then((result) => {
             results.push(result);
             completed += 1;
-
             if (!responseClosed) {
               sendSse(res, {
                 type: "result",
@@ -1413,12 +1146,10 @@ async function handleNvidiaBenchmark(req, res) {
           })
           .finally(() => {
             active -= 1;
-
             if (cursor >= models.length && active === 0) {
               flushDone();
               return;
             }
-
             launchNext();
           });
       }
@@ -1428,16 +1159,16 @@ async function handleNvidiaBenchmark(req, res) {
   });
 }
 
+// ============================================================================
+// Session handlers
+// ============================================================================
+
 async function handleSessionLoad(req, res) {
   let body;
   try {
     body = await readJsonBody(req);
   } catch {
-    sendJson(res, 400, {
-      error: {
-        message: "Invalid JSON body"
-      }
-    });
+    sendJson(res, 400, { error: { message: "Invalid JSON body" } });
     return;
   }
 
@@ -1459,7 +1190,6 @@ async function handleSessionLoad(req, res) {
   try {
     const markdown = readFileSync(filePath, "utf8");
     const stats = statSync(filePath);
-
     sendJson(res, 200, {
       ok: true,
       exists: true,
@@ -1483,11 +1213,7 @@ async function handleSessionSave(req, res) {
   try {
     body = await readJsonBody(req);
   } catch {
-    sendJson(res, 400, {
-      error: {
-        message: "Invalid JSON body"
-      }
-    });
+    sendJson(res, 400, { error: { message: "Invalid JSON body" } });
     return;
   }
 
@@ -1498,7 +1224,6 @@ async function handleSessionSave(req, res) {
   try {
     mkdirSync(SESSION_ROOT, { recursive: true });
     writeFileSync(filePath, serializeSessionMarkdown(document, messages), "utf8");
-
     sendJson(res, 200, {
       ok: true,
       directory: SESSION_ROOT,
@@ -1521,11 +1246,7 @@ async function handleSessionDelete(req, res) {
   try {
     body = await readJsonBody(req);
   } catch {
-    sendJson(res, 400, {
-      error: {
-        message: "Invalid JSON body"
-      }
-    });
+    sendJson(res, 400, { error: { message: "Invalid JSON body" } });
     return;
   }
 
@@ -1533,16 +1254,8 @@ async function handleSessionDelete(req, res) {
   const filePath = sessionFilePathForDocument(SESSION_ROOT, document);
 
   try {
-    if (existsSync(filePath)) {
-      unlinkSync(filePath);
-    }
-
-    sendJson(res, 200, {
-      ok: true,
-      directory: SESSION_ROOT,
-      filePath,
-      document
-    });
+    if (existsSync(filePath)) unlinkSync(filePath);
+    sendJson(res, 200, { ok: true, directory: SESSION_ROOT, filePath, document });
   } catch (error) {
     sendJson(res, 500, {
       error: {
@@ -1551,6 +1264,137 @@ async function handleSessionDelete(req, res) {
     });
   }
 }
+
+// ============================================================================
+// Test command (used by smoke tests)
+// ============================================================================
+
+let pendingTestCommand = null;
+let testCommandSeq = 0;
+const testCommandStatuses = new Map();
+
+function normalizeTestDocument(document) {
+  if (!document || typeof document !== "object") return null;
+  return {
+    key: String(document.key ?? ""),
+    title: String(document.title ?? document.name ?? ""),
+    name: String(document.name ?? document.title ?? ""),
+    fullName: String(document.fullName ?? "")
+  };
+}
+
+function rememberTestCommandStatus(id, patch) {
+  if (!id) return null;
+  const current = testCommandStatuses.get(id) || {
+    id,
+    stage: "queued",
+    updatedAt: new Date().toISOString()
+  };
+  const next = { ...current, ...patch, id, updatedAt: new Date().toISOString() };
+  testCommandStatuses.set(id, next);
+  if (testCommandStatuses.size > 40) {
+    const oldest = testCommandStatuses.keys().next().value;
+    testCommandStatuses.delete(oldest);
+  }
+  return next;
+}
+
+function documentMatchesTestCommand(command, document) {
+  const target = String(command.documentTitle || command.documentKey || "")
+    .trim()
+    .toLowerCase();
+  if (!target) return true;
+  const normalized = normalizeTestDocument(document);
+  if (!normalized) return false;
+  return [normalized.key, normalized.title, normalized.name, normalized.fullName]
+    .filter(Boolean)
+    .some((value) => value.toLowerCase().includes(target));
+}
+
+async function handleTestCommandPush(req, res) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    sendJson(res, 400, { error: { message: "Invalid JSON body" } });
+    return;
+  }
+  const prompt = String(body?.prompt ?? "");
+  if (!prompt.trim()) {
+    sendJson(res, 400, { error: { message: "Prompt is required" } });
+    return;
+  }
+  const id = `test-${Date.now()}-${++testCommandSeq}`;
+  pendingTestCommand = {
+    id,
+    prompt,
+    documentTitle: String(body?.documentTitle ?? ""),
+    documentKey: String(body?.documentKey ?? ""),
+    visibleDelayMs: Math.min(8000, Math.max(600, Number(body?.visibleDelayMs) || 1800)),
+    createdAt: new Date().toISOString()
+  };
+  rememberTestCommandStatus(id, { stage: "queued" });
+  sendJson(res, 200, { ok: true, id, stage: "queued" });
+}
+
+async function handleTestCommandPoll(req, res) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    sendJson(res, 400, { error: { message: "Invalid JSON body" } });
+    return;
+  }
+  if (!pendingTestCommand) {
+    sendJson(res, 200, { ok: true, command: null });
+    return;
+  }
+  if (!documentMatchesTestCommand(pendingTestCommand, body?.document)) {
+    sendJson(res, 200, { ok: true, command: null });
+    return;
+  }
+  const command = pendingTestCommand;
+  pendingTestCommand = null;
+  rememberTestCommandStatus(command.id, {
+    stage: "delivered",
+    document: normalizeTestDocument(body?.document)
+  });
+  sendJson(res, 200, { ok: true, command });
+}
+
+async function handleTestCommandAck(req, res) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    sendJson(res, 400, { error: { message: "Invalid JSON body" } });
+    return;
+  }
+  const id = String(body?.id ?? "");
+  if (!id) {
+    sendJson(res, 400, { error: { message: "Command id is required" } });
+    return;
+  }
+  const status = rememberTestCommandStatus(id, {
+    stage: String(body?.stage ?? "ack"),
+    document: normalizeTestDocument(body?.document),
+    detail: body?.detail || {}
+  });
+  sendJson(res, 200, { ok: true, status });
+}
+
+function handleTestCommandStatus(res, requestUrl) {
+  const id = String(requestUrl.searchParams.get("id") ?? "");
+  if (!id) {
+    sendJson(res, 400, { error: { message: "Command id is required" } });
+    return;
+  }
+  sendJson(res, 200, { ok: true, status: testCommandStatuses.get(id) || null });
+}
+
+// ============================================================================
+// Server
+// ============================================================================
 
 const server = createServer(async (req, res) => {
   if (!req.url) {
@@ -1571,34 +1415,45 @@ const server = createServer(async (req, res) => {
   if (req.method === "GET" && pathname === "/health") {
     sendJson(res, 200, {
       ok: true,
-      provider: "nvidia-relay",
+      platform: process.platform,
       transport: "curl",
-      proxy: PROXY_ENV.HTTPS_PROXY || PROXY_ENV.HTTP_PROXY || "",
-      sessionRoot: SESSION_ROOT
+      systemProxy: SYSTEM_PROXY || "",
+      sessionRoot: SESSION_ROOT,
+      providers: Object.keys(PROVIDER_META)
     });
     return;
   }
 
   if (req.method === "GET" && pathname === "/bootstrap") {
-    sendJson(res, 200, {
-      ok: true,
-      settings: BOOTSTRAP_SETTINGS
-    });
+    sendJson(res, 200, { ok: true, settings: BOOTSTRAP_SETTINGS });
     return;
   }
 
-  if (req.method === "GET" && pathname === "/nvidia/v1/models") {
-    await handleNvidiaModels(req, res);
-    return;
+  // Provider-agnostic routes: /<provider>/v1/{models,chat/completions,benchmark}
+  const providerRouteMatch = pathname.match(
+    /^\/(nvidia|openrouter)\/v1\/(models|chat\/completions|benchmark)$/
+  );
+  if (providerRouteMatch) {
+    const providerId = providerRouteMatch[1];
+    const endpoint = providerRouteMatch[2];
+
+    if (endpoint === "models" && (req.method === "GET" || req.method === "POST")) {
+      await handleListModels(req, res, providerId);
+      return;
+    }
+    if (endpoint === "chat/completions" && req.method === "POST") {
+      await handleChatCompletions(req, res, providerId);
+      return;
+    }
+    if (endpoint === "benchmark" && req.method === "POST") {
+      await handleBenchmark(req, res, providerId);
+      return;
+    }
   }
 
+  // Legacy NVIDIA routes for backwards compatibility
   if (req.method === "POST" && pathname === "/nvidia/v1/models/benchmark") {
-    await handleNvidiaBenchmark(req, res);
-    return;
-  }
-
-  if (req.method === "POST" && pathname === "/nvidia/v1/chat/completions") {
-    await handleNvidiaChat(req, res);
+    await handleBenchmark(req, res, "nvidia");
     return;
   }
 
@@ -1606,12 +1461,10 @@ const server = createServer(async (req, res) => {
     await handleSessionLoad(req, res);
     return;
   }
-
   if (req.method === "POST" && pathname === "/session/save") {
     await handleSessionSave(req, res);
     return;
   }
-
   if (req.method === "POST" && pathname === "/session/delete") {
     await handleSessionDelete(req, res);
     return;
@@ -1621,17 +1474,14 @@ const server = createServer(async (req, res) => {
     await handleTestCommandPush(req, res);
     return;
   }
-
   if (req.method === "POST" && pathname === "/test-command/poll") {
     await handleTestCommandPoll(req, res);
     return;
   }
-
   if (req.method === "POST" && pathname === "/test-command/ack") {
     await handleTestCommandAck(req, res);
     return;
   }
-
   if (req.method === "GET" && pathname === "/test-command/status") {
     handleTestCommandStatus(res, requestUrl);
     return;
@@ -1642,4 +1492,11 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`WPS AI relay listening on http://127.0.0.1:${PORT}`);
+  console.log(`  platform: ${process.platform}`);
+  console.log(`  session root: ${SESSION_ROOT}`);
+  if (SYSTEM_PROXY) {
+    console.log(`  default proxy: ${SYSTEM_PROXY}`);
+  } else {
+    console.log("  default proxy: (direct)");
+  }
 });

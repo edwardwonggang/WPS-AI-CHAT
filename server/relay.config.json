@@ -1,10 +1,21 @@
 {
-  "proxyUrl": "http://proxy.zte.com.cn:80",
+  "proxyUrl": "",
+  "sessionRoot": "",
   "defaults": {
-    "providerId": "nvidia",
-    "baseUrl": "http://127.0.0.1:3888/nvidia/v1",
-    "apiKey": "nvapi-rand-4f8c2a91d7b34e5aa6c1f903b8d2e741",
-    "model": "deepseek-ai/deepseek-v3.1-terminus",
+    "activeProvider": "nvidia",
+    "providers": {
+      "nvidia": {
+        "baseUrl": "https://integrate.api.nvidia.com/v1",
+        "apiKey": "",
+        "model": "deepseek-ai/deepseek-v3.1-terminus"
+      },
+      "openrouter": {
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "apiKey": "",
+        "model": ""
+      }
+    },
+    "proxyUrl": "",
     "temperature": 0.5,
     "maxTokens": "",
     "systemPrompt": "You are the WPS writing assistant. Output Markdown suitable for direct insertion into the document body. Use headings, lists, bold, and italics only when they improve readability. Do not add greetings, prefaces, or explanatory filler.",
