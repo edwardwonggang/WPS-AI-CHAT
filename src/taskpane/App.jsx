@@ -1207,6 +1207,26 @@ export default function App() {
                     <code>direct</code> 可强制直连
                   </span>
                 </div>
+
+                <div className="form-group">
+                  <label className="form-label">
+                    <Icon name="provider" size={14} />
+                    <span>传输模式</span>
+                  </label>
+                  <select
+                    className="form-input"
+                    value={settings.streamingMode || "auto"}
+                    onChange={(event) =>
+                      updateSetting("streamingMode", event.target.value)
+                    }
+                  >
+                    <option value="auto">自动：优先流式，失败时回退非流式</option>
+                    <option value="buffered">非流式：等待完整响应（推荐公司代理）</option>
+                  </select>
+                  <span className="form-hint">
+                    有些企业代理会拦截 SSE 长连接。如果每次都提示 Internal Server Error，改成"非流式"。
+                  </span>
+                </div>
               </section>
 
               <details className="settings-section details-panel">
