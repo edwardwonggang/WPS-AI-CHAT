@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -9,13 +9,12 @@ import {
   writeFileSync
 } from "node:fs";
 import { createServer } from "node:http";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { ProxyAgent, Agent, fetch as undiciFetch } from "undici";
 
 const PORT = 3888;
-const CURL_BIN = process.platform === "win32" ? "curl.exe" : "curl";
 const RELAY_CONFIG_URL = new URL("./relay.config.json", import.meta.url);
-const LOCAL_NO_PROXY = "127.0.0.1,localhost,::1";
 const DEFAULT_BENCHMARK_TIMEOUT_MS = 12000;
 const DEFAULT_BENCHMARK_CONCURRENCY = 6;
 
@@ -25,19 +24,11 @@ const DEFAULT_SESSION_ROOT =
     : join(homedir(), ".wps-ai", "sessions");
 
 const SESSION_BLOCK_CLOSE = "<!-- /WPS-AI-MESSAGE -->";
-const BENCHMARK_MESSAGES = [
-  { role: "user", content: "Reply with OK only." }
-];
+const BENCHMARK_MESSAGES = [{ role: "user", content: "Reply with OK only." }];
 
-// Static provider metadata. Base URLs can be overridden per request via the
-// X-Upstream-Base-Url header or the `baseUrl` form field.
 const PROVIDER_META = {
-  nvidia: {
-    defaultBaseUrl: "https://integrate.api.nvidia.com/v1"
-  },
-  openrouter: {
-    defaultBaseUrl: "https://openrouter.ai/api/v1"
-  }
+  nvidia: { defaultBaseUrl: "https://integrate.api.nvidia.com/v1" },
+  openrouter: { defaultBaseUrl: "https://openrouter.ai/api/v1" }
 };
 
 const DEFAULT_BOOTSTRAP_SETTINGS = Object.freeze({
@@ -102,7 +93,6 @@ function resolveWindowsProxy() {
     const settingsPath =
       "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 
-    // Only honor the IE/system proxy if it is actually enabled.
     try {
       const enableOutput = execFileSync(
         "reg.exe",
@@ -116,22 +106,15 @@ function resolveWindowsProxy() {
       const enableMatch = enableOutput.match(
         /ProxyEnable\s+REG_\w+\s+0x([0-9a-f]+)/i
       );
-      if (!enableMatch || parseInt(enableMatch[1], 16) === 0) {
-        return "";
-      }
+      if (!enableMatch || parseInt(enableMatch[1], 16) === 0) return "";
     } catch {
-      // Treat missing ProxyEnable as disabled.
       return "";
     }
 
     const output = execFileSync(
       "reg.exe",
       ["query", settingsPath, "/v", "ProxyServer"],
-      {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        windowsHide: true
-      }
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true }
     );
     const match = output.match(/ProxyServer\s+REG_\w+\s+(.+)$/im);
     if (!match) return "";
@@ -174,9 +157,7 @@ function resolveMacSystemProxy() {
       const port = output.match(/HTTPPort\s*:\s*(\d+)/)?.[1];
       if (host && port) return `http://${host}:${port}`;
     }
-  } catch {
-    // scutil may be unavailable.
-  }
+  } catch {}
   return "";
 }
 
@@ -195,39 +176,17 @@ function resolveSystemProxy(config) {
   );
 }
 
-function buildEnvWithProxy(proxyUrl) {
-  const noProxy = [
-    LOCAL_NO_PROXY,
-    process.env.NO_PROXY || "",
-    process.env.no_proxy || ""
-  ]
-    .filter(Boolean)
-    .join(",");
+// Cache ProxyAgent / Agent instances by proxy URL so we reuse connections.
+const DISPATCHER_CACHE = new Map();
+const DIRECT_DISPATCHER = new Agent();
 
+function getDispatcher(proxyUrl) {
   const normalized = normalizeProxyUrl(proxyUrl);
-  if (!normalized) {
-    return {
-      ...process.env,
-      HTTP_PROXY: "",
-      HTTPS_PROXY: "",
-      http_proxy: "",
-      https_proxy: "",
-      ALL_PROXY: "",
-      all_proxy: "",
-      NO_PROXY: noProxy,
-      no_proxy: noProxy
-    };
-  }
-
-  return {
-    ...process.env,
-    HTTP_PROXY: normalized,
-    HTTPS_PROXY: normalized,
-    http_proxy: normalized,
-    https_proxy: normalized,
-    NO_PROXY: noProxy,
-    no_proxy: noProxy
-  };
+  if (!normalized) return DIRECT_DISPATCHER;
+  if (DISPATCHER_CACHE.has(normalized)) return DISPATCHER_CACHE.get(normalized);
+  const agent = new ProxyAgent({ uri: normalized });
+  DISPATCHER_CACHE.set(normalized, agent);
+  return agent;
 }
 
 // ============================================================================
@@ -272,7 +231,8 @@ function normalizeSessionRoot(config) {
 }
 
 function normalizeSessionDocument(input) {
-  const title = String(input?.title ?? input?.name ?? "").trim() || "Untitled Document";
+  const title =
+    String(input?.title ?? input?.name ?? "").trim() || "Untitled Document";
   const path = String(input?.path ?? "").trim();
   let fullName = String(input?.fullName ?? "").trim();
   if (!fullName && path) {
@@ -281,13 +241,7 @@ function normalizeSessionDocument(input) {
   const key =
     String(input?.key ?? "").trim() ||
     (fullName ? `saved:${fullName.toLowerCase()}` : `unsaved:${title}`);
-  return {
-    key,
-    title,
-    path,
-    fullName,
-    isSaved: Boolean(fullName)
-  };
+  return { key, title, path, fullName, isSaved: Boolean(fullName) };
 }
 
 function normalizeSessionMessages(input) {
@@ -365,7 +319,6 @@ function parseSessionMarkdown(markdown) {
   const messages = [];
   const pattern =
     /<!-- WPS-AI-MESSAGE role="([^"]+)" id="([^"]*)" error="([^"]*)" -->\n?([\s\S]*?)\n?<!-- \/WPS-AI-MESSAGE -->/g;
-
   let match;
   while ((match = pattern.exec(String(markdown ?? ""))) !== null) {
     messages.push({
@@ -380,7 +333,7 @@ function parseSessionMarkdown(markdown) {
 }
 
 // ============================================================================
-// HTTP helpers
+// Shared state
 // ============================================================================
 
 const RELAY_CONFIG = readRelayConfig();
@@ -388,38 +341,6 @@ const SYSTEM_PROXY = resolveSystemProxy(RELAY_CONFIG);
 const BOOTSTRAP_SETTINGS = normalizeBootstrapSettings(RELAY_CONFIG);
 const SESSION_ROOT = normalizeSessionRoot(RELAY_CONFIG);
 const RELAY_LOG_BUFFER = [];
-
-function setCorsHeaders(res, req = null) {
-  const origin = req?.headers?.origin;
-  const requestHeaders = req?.headers?.["access-control-request-headers"];
-  const requestPrivateNetwork = req?.headers?.["access-control-request-private-network"];
-
-  res.setHeader("Access-Control-Allow-Origin", origin || "*");
-  res.setHeader(
-    "Vary",
-    "Origin, Access-Control-Request-Headers, Access-Control-Request-Private-Network"
-  );
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    requestHeaders ||
-      "authorization,content-type,accept,x-upstream-base-url,x-upstream-proxy,http-referer,x-title"
-  );
-  res.setHeader("Access-Control-Max-Age", "600");
-  if (requestPrivateNetwork === "true") {
-    res.setHeader("Access-Control-Allow-Private-Network", "true");
-  }
-}
-
-function sendJson(res, statusCode, payload) {
-  setCorsHeaders(res);
-  res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(payload));
-}
-
-function sendSse(res, payload) {
-  res.write(`data: ${JSON.stringify(payload)}\n\n`);
-}
 
 function relayLog(scope, message, details = undefined) {
   const suffix =
@@ -479,19 +400,47 @@ function sanitizePayloadForLog(payload) {
   return copy;
 }
 
-/**
- * Write a `data: {type:"relay_debug",...}` event into the SSE response so the
- * front-end can merge relay-side events into its own Debug Logs view. The
- * front-end recognizes `type === "relay_debug"` and routes these to the log
- * buffer instead of the chat stream.
- */
 function emitSseDebug(res, entry) {
   if (!res || res.writableEnded) return;
   try {
     res.write(`data: ${JSON.stringify({ type: "relay_debug", ...entry })}\n\n`);
-  } catch {
-    // Best-effort.
+  } catch {}
+}
+
+// ============================================================================
+// HTTP helpers
+// ============================================================================
+
+function setCorsHeaders(res, req = null) {
+  const origin = req?.headers?.origin;
+  const requestHeaders = req?.headers?.["access-control-request-headers"];
+  const requestPrivateNetwork = req?.headers?.["access-control-request-private-network"];
+
+  res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  res.setHeader(
+    "Vary",
+    "Origin, Access-Control-Request-Headers, Access-Control-Request-Private-Network"
+  );
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    requestHeaders ||
+      "authorization,content-type,accept,x-upstream-base-url,x-upstream-proxy,http-referer,x-title"
+  );
+  res.setHeader("Access-Control-Max-Age", "600");
+  if (requestPrivateNetwork === "true") {
+    res.setHeader("Access-Control-Allow-Private-Network", "true");
   }
+}
+
+function sendJson(res, statusCode, payload) {
+  setCorsHeaders(res);
+  res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(payload));
+}
+
+function sendSse(res, payload) {
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
 async function readJsonBody(req) {
@@ -529,11 +478,10 @@ function resolveUpstreamBaseUrl(req, providerId, body = null) {
 }
 
 /**
- * Resolve which proxy to use for this request.
- * Header `X-Upstream-Proxy` overrides the system proxy:
- *   - `__direct__` → force direct (ignore system proxy)
+ * Resolve which proxy the relay should use for this request:
+ *   - `__direct__` → force direct (skip system proxy)
  *   - any URL → use this proxy
- *   - empty → use system/config proxy
+ *   - empty → fall back to the system/config proxy detected at boot
  */
 function resolveUpstreamProxy(req, body = null) {
   const headerValue = String(req.headers["x-upstream-proxy"] || "").trim();
@@ -543,220 +491,6 @@ function resolveUpstreamProxy(req, body = null) {
   if (requested === "__direct__") return "";
   if (requested) return normalizeProxyUrl(requested);
   return SYSTEM_PROXY || "";
-}
-
-function formatCurlFailure(stderr) {
-  const message = String(stderr || "").trim();
-  if (!message) return "Failed to reach upstream.";
-  return message
-    .replace(/^curl:\s*/i, "")
-    .replace(/^\(\d+\)\s*/, "");
-}
-
-function isProxyConnectionFailure(message) {
-  const normalized = String(message || "");
-  return (
-    /proxy/i.test(normalized) ||
-    /failed to connect to 127\.0\.0\.1 port \d+/i.test(normalized) ||
-    /failed to connect to localhost port \d+/i.test(normalized) ||
-    /could not connect to server/i.test(normalized) ||
-    /connection refused/i.test(normalized) ||
-    /proxyconnect/i.test(normalized)
-  );
-}
-
-// ============================================================================
-// SSE parsing
-// ============================================================================
-
-function normalizeContent(content) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((item) => {
-      if (typeof item === "string") return item;
-      if (item && typeof item === "object" && "text" in item) {
-        return String(item.text ?? "");
-      }
-      return "";
-    })
-    .join("");
-}
-
-function extractChunk(payload) {
-  const choice = payload?.choices?.[0];
-  if (!choice) return "";
-  return (
-    normalizeContent(choice.delta?.content) ||
-    normalizeContent(choice.message?.content) ||
-    ""
-  );
-}
-
-function parseSseEvent(block) {
-  const data = block
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith("data:"))
-    .map((line) => line.slice(5).trim())
-    .join("\n")
-    .trim();
-  if (!data || data === "[DONE]") return null;
-  try {
-    return JSON.parse(data);
-  } catch {
-    return null;
-  }
-}
-
-// ============================================================================
-// Curl wrappers
-// ============================================================================
-
-function createCurlArgs({
-  authorization,
-  url,
-  method = "GET",
-  headers = [],
-  dataFromStdin = false,
-  stream = false,
-  includeStatus = false
-}) {
-  const args = ["-sS"];
-  if (stream) args.push("-N");
-  // -w writes the status code to stdout only if requested (not in streaming mode).
-  if (includeStatus && !stream) {
-    args.push("-o", "-", "-w", "\n__HTTP_STATUS__:%{http_code}");
-  }
-  args.push("-X", method);
-  if (authorization) args.push("-H", `Authorization: ${authorization}`);
-  for (const header of headers) {
-    args.push("-H", header);
-  }
-  if (dataFromStdin) args.push("--data-binary", "@-");
-  args.push(url);
-  return args;
-}
-
-function buildAttemptEnvs(preferredProxy) {
-  const attempts = [];
-  const normalizedPreferred = normalizeProxyUrl(preferredProxy);
-  if (normalizedPreferred) {
-    attempts.push({
-      label: "proxy",
-      env: buildEnvWithProxy(normalizedPreferred)
-    });
-  }
-  attempts.push({
-    label: "direct",
-    env: buildEnvWithProxy("")
-  });
-  return attempts;
-}
-
-function runCurlBuffered({
-  authorization,
-  url,
-  method = "GET",
-  headers = [],
-  body = "",
-  preferredProxy = ""
-}) {
-  const attempts = buildAttemptEnvs(preferredProxy);
-
-  function runAttempt(index) {
-    return new Promise((resolvePromise, reject) => {
-      const attempt = attempts[index];
-      const curl = spawn(
-        CURL_BIN,
-        createCurlArgs({
-          authorization,
-          url,
-          method,
-          headers,
-          dataFromStdin: method !== "GET",
-          includeStatus: true
-        }),
-        {
-          env: attempt.env,
-          stdio: ["pipe", "pipe", "pipe"],
-          windowsHide: true
-        }
-      );
-
-      let stdout = "";
-      let stderr = "";
-
-      curl.on("error", (error) => {
-        reject(error instanceof Error ? error : new Error("Failed to start curl."));
-      });
-
-      curl.stdout.on("data", (chunk) => {
-        stdout += chunk.toString("utf8");
-      });
-
-      curl.stderr.on("data", (chunk) => {
-        stderr += chunk.toString("utf8");
-      });
-
-      curl.on("close", (code) => {
-        if (code !== 0) {
-          const message = formatCurlFailure(stderr || stdout);
-          if (
-            attempt.label === "proxy" &&
-            index + 1 < attempts.length &&
-            isProxyConnectionFailure(message)
-          ) {
-            relayLog("proxy", "Proxy attempt failed, retrying direct.", { url, message });
-            resolvePromise(runAttempt(index + 1));
-            return;
-          }
-          reject(new Error(message));
-          return;
-        }
-
-        // Extract HTTP status we appended via `-w`.
-        const statusMatch = stdout.match(/\n__HTTP_STATUS__:(\d+)\s*$/);
-        const httpStatus = statusMatch ? Number(statusMatch[1]) : 0;
-        const responseBody = statusMatch
-          ? stdout.slice(0, statusMatch.index)
-          : stdout;
-
-        if (httpStatus >= 200 && httpStatus < 300) {
-          resolvePromise(responseBody);
-          return;
-        }
-
-        // Non-2xx from upstream: surface the body as the error message.
-        const upstreamMessage =
-          parseUpstreamErrorBody(responseBody) ||
-          `Upstream responded with HTTP ${httpStatus || "unknown"}.`;
-
-        if (
-          attempt.label === "proxy" &&
-          index + 1 < attempts.length &&
-          httpStatus >= 500
-        ) {
-          relayLog("proxy", "Proxy returned 5xx, retrying direct.", {
-            url,
-            status: httpStatus,
-            message: upstreamMessage
-          });
-          resolvePromise(runAttempt(index + 1));
-          return;
-        }
-
-        reject(new Error(`HTTP ${httpStatus}: ${upstreamMessage}`));
-      });
-
-      if (method === "GET") {
-        curl.stdin.end();
-        return;
-      }
-      curl.stdin.end(body);
-    });
-  }
-
-  return runAttempt(0);
 }
 
 function parseUpstreamErrorBody(body) {
@@ -773,9 +507,7 @@ function parseUpstreamErrorBody(body) {
       const providerName = json.error.metadata?.provider_name;
       if (providerName) parts.push(`provider=${providerName}`);
       const raw = json.error.metadata?.raw;
-      if (raw && typeof raw === "string") {
-        parts.push(`upstream=${raw.slice(0, 200)}`);
-      }
+      if (raw && typeof raw === "string") parts.push(`upstream=${raw.slice(0, 200)}`);
       if (parts.length > 0) return parts.join(" | ");
     }
     return json?.message || JSON.stringify(json).slice(0, 400);
@@ -784,48 +516,8 @@ function parseUpstreamErrorBody(body) {
   }
 }
 
-async function listProviderModels({
-  providerId,
-  authorization,
-  baseUrl,
-  preferredProxy,
-  extraHeaders = []
-}) {
-  const url = `${baseUrl.replace(/\/+$/, "")}/models`;
-  const raw = await runCurlBuffered({
-    authorization,
-    url,
-    method: "GET",
-    headers: ["Accept: application/json", ...extraHeaders],
-    preferredProxy
-  });
-
-  const json = JSON.parse(raw);
-  const seen = new Set();
-  const list = Array.isArray(json?.data)
-    ? json.data
-    : Array.isArray(json?.models)
-      ? json.models
-      : [];
-
-  const data = list
-    .map((item) => ({
-      id: String(item?.id ?? "").trim(),
-      object: String(item?.object ?? "model"),
-      owned_by: String(item?.owned_by ?? item?.ownedBy ?? "").trim()
-    }))
-    .filter((item) => {
-      if (!item.id || seen.has(item.id)) return false;
-      seen.add(item.id);
-      return true;
-    })
-    .sort((left, right) => left.id.localeCompare(right.id));
-
-  return { object: "list", data };
-}
-
 function buildProviderExtraHeaders(providerId, req, body = null) {
-  if (providerId !== "openrouter") return [];
+  if (providerId !== "openrouter") return {};
   const referer =
     String(req.headers["http-referer"] || "").trim() ||
     String(body?.referer ?? "").trim() ||
@@ -834,220 +526,281 @@ function buildProviderExtraHeaders(providerId, req, body = null) {
     String(req.headers["x-title"] || "").trim() ||
     String(body?.title ?? "").trim() ||
     "WPS AI";
-  return [`HTTP-Referer: ${referer}`, `X-Title: ${title}`];
+  return { "HTTP-Referer": referer, "X-Title": title };
 }
 
-function classifyBenchmarkFailure(stderr) {
-  const message = String(stderr || "");
-  if (/operation timed out/i.test(message)) {
-    return { status: "timeout", message: "Timed out before first content token." };
+// ============================================================================
+// Core upstream request wrapper — Node.js fetch + undici ProxyAgent
+// ============================================================================
+
+/**
+ * Try the request through the preferred proxy first, then fall back to
+ * direct connection if the proxy throws a connection error.
+ */
+async function fetchUpstream(url, init, preferredProxy, debugFn = null) {
+  const attempts = [];
+  if (preferredProxy) {
+    attempts.push({ label: "proxy", proxy: preferredProxy });
   }
-  if (/(400|404|415|422)/.test(message)) {
-    return { status: "unsupported", message: "This model did not accept chat/completions." };
+  attempts.push({ label: "direct", proxy: "" });
+
+  let lastError = null;
+  for (let i = 0; i < attempts.length; i += 1) {
+    const attempt = attempts[i];
+    const dispatcher = getDispatcher(attempt.proxy);
+    try {
+      debugFn?.("debug", "Upstream fetch attempt.", {
+        attemptLabel: attempt.label,
+        proxy: attempt.proxy || "(direct)",
+        url
+      });
+      const response = await undiciFetch(url, { ...init, dispatcher });
+      return { response, attempt };
+    } catch (error) {
+      lastError = error;
+      debugFn?.("error", "Upstream fetch threw before response headers.", {
+        attemptLabel: attempt.label,
+        proxy: attempt.proxy || "(direct)",
+        errorName: error?.name || "",
+        errorMessage: error?.message || String(error),
+        errorCause:
+          error?.cause && typeof error.cause === "object"
+            ? String(error.cause.message || error.cause.code || error.cause)
+            : ""
+      });
+
+      // Only fall through to direct when the first attempt was the proxy
+      // and it failed at the network layer.
+      if (attempt.label === "proxy") continue;
+      throw error;
+    }
   }
-  if (/(401|403)/.test(message)) {
-    return { status: "unauthorized", message: "The current key cannot access this model." };
-  }
-  return { status: "error", message: formatCurlFailure(message) };
+  throw lastError || new Error("Upstream fetch failed.");
 }
 
-function createBenchmarkBody(model, bufferedOnly = false) {
-  return JSON.stringify({
-    model,
-    messages: BENCHMARK_MESSAGES,
-    temperature: 0,
-    stream: !bufferedOnly,
-    max_tokens: 8
-  });
+async function fetchUpstreamText(url, init, preferredProxy, debugFn = null) {
+  const { response, attempt } = await fetchUpstream(url, init, preferredProxy, debugFn);
+  const text = await response.text();
+  return {
+    ok: response.ok,
+    status: response.status,
+    statusText: response.statusText,
+    text,
+    headers: response.headers,
+    attempt
+  };
 }
 
-function benchmarkModel({
+// ============================================================================
+// Model list
+// ============================================================================
+
+function normalizeModelEntry(item) {
+  return {
+    id: String(item?.id ?? "").trim(),
+    object: String(item?.object ?? "model"),
+    owned_by: String(item?.owned_by ?? item?.ownedBy ?? "").trim()
+  };
+}
+
+async function listProviderModels({
+  authorization,
+  baseUrl,
+  preferredProxy,
+  extraHeaders = {},
+  debugFn
+}) {
+  const url = `${baseUrl.replace(/\/+$/, "")}/models`;
+  const result = await fetchUpstreamText(
+    url,
+    {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        Authorization: authorization,
+        ...extraHeaders
+      }
+    },
+    preferredProxy,
+    debugFn
+  );
+
+  if (!result.ok) {
+    throw new Error(
+      parseUpstreamErrorBody(result.text) ||
+        `HTTP ${result.status} ${result.statusText}`
+    );
+  }
+
+  const json = JSON.parse(result.text);
+  const seen = new Set();
+  const list = Array.isArray(json?.data)
+    ? json.data
+    : Array.isArray(json?.models)
+      ? json.models
+      : [];
+
+  const data = list
+    .map(normalizeModelEntry)
+    .filter((item) => {
+      if (!item.id || seen.has(item.id)) return false;
+      seen.add(item.id);
+      return true;
+    })
+    .sort((l, r) => l.id.localeCompare(r.id));
+
+  return { object: "list", data };
+}
+
+// ============================================================================
+// Benchmark
+// ============================================================================
+
+function extractChunk(payload) {
+  const choice = payload?.choices?.[0];
+  if (!choice) return "";
+  const source = choice.delta?.content ?? choice.message?.content;
+  if (typeof source === "string") return source;
+  if (Array.isArray(source)) {
+    return source
+      .map((item) =>
+        typeof item === "string"
+          ? item
+          : item && typeof item === "object" && "text" in item
+            ? String(item.text ?? "")
+            : ""
+      )
+      .join("");
+  }
+  return "";
+}
+
+function parseSseEventBlock(block) {
+  const data = block
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trim())
+    .join("\n")
+    .trim();
+  if (!data || data === "[DONE]") return null;
+  try {
+    return JSON.parse(data);
+  } catch {
+    return null;
+  }
+}
+
+async function benchmarkModel({
   authorization,
   baseUrl,
   model,
   timeoutMs,
   preferredProxy,
-  extraHeaders = [],
-  bufferedOnly = false
+  extraHeaders = {}
 }) {
-  return new Promise((resolvePromise) => {
-    const startedAt = Date.now();
-    let buffer = "";
-    let firstByteMs = null;
-    let firstTokenMs = null;
-    let settled = false;
-    let activeCurl = null;
-    let nonSseDetected = false;
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-    const attempts = buildAttemptEnvs(preferredProxy);
-
-    function finalize(status, message) {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeoutId);
-      try {
-        activeCurl?.kill();
-      } catch {
-        // Ignore.
-      }
-      resolvePromise({
-        model,
-        ok: status === "ok",
-        status,
-        firstByteMs,
-        firstTokenMs,
-        totalMs:
-          firstTokenMs !== null ? firstTokenMs : Math.max(0, Date.now() - startedAt),
-        message: message || ""
-      });
-    }
-
-    const timeoutId = setTimeout(() => {
-      finalize("timeout", "Timed out before first content token.");
-    }, timeoutMs);
-
-    function startAttempt(index) {
-      const attempt = attempts[index];
-      let stderr = "";
-      let attemptCompleted = false;
-
-      activeCurl = spawn(
-        CURL_BIN,
-        createCurlArgs({
-          authorization,
-          url: `${baseUrl.replace(/\/+$/, "")}/chat/completions`,
-          method: "POST",
-          headers: ["Content-Type: application/json", ...extraHeaders],
-          dataFromStdin: true,
-          stream: !bufferedOnly
-        }),
-        {
-          env: attempt.env,
-          stdio: ["pipe", "pipe", "pipe"],
-          windowsHide: true
-        }
-      );
-
-      activeCurl.on("error", (error) => {
-        finalize(
-          "error",
-          error instanceof Error ? error.message : "Failed to start curl"
-        );
-      });
-
-      activeCurl.stderr.on("data", (chunk) => {
-        stderr += chunk.toString("utf8");
-      });
-
-      activeCurl.stdout.on("data", (chunk) => {
-        if (firstByteMs === null) {
-          firstByteMs = Math.max(0, Date.now() - startedAt);
-        }
-
-        const text = chunk.toString("utf8");
-        buffer += text;
-
-        if (bufferedOnly) {
-          // Wait for full JSON at `close`.
-          return;
-        }
-
-        // Detect non-SSE body (proxy error page).
-        if (!nonSseDetected && buffer.length > 4) {
-          const preview = buffer.trimStart();
-          const looksLikeSse =
-            preview.startsWith("data:") ||
-            preview.startsWith(":") ||
-            preview.startsWith("event:");
-          if (!looksLikeSse) {
-            nonSseDetected = true;
-          }
-        }
-
-        if (nonSseDetected) return;
-
-        const parts = buffer.split(/\r?\n\r?\n/);
-        buffer = parts.pop() ?? "";
-        for (const part of parts) {
-          const payload = parseSseEvent(part);
-          const tokenText = extractChunk(payload);
-          if (tokenText && firstTokenMs === null) {
-            firstTokenMs = Math.max(0, Date.now() - startedAt);
-            finalize("ok", "");
-            return;
-          }
-        }
-      });
-
-      activeCurl.on("close", () => {
-        if (settled || attemptCompleted) return;
-        attemptCompleted = true;
-
-        if (firstTokenMs !== null) {
-          finalize("ok", "");
-          return;
-        }
-
-        // Non-streaming mode: parse the final JSON to determine success.
-        if (bufferedOnly) {
-          try {
-            const json = JSON.parse(buffer);
-            if (json?.error) {
-              finalize(
-                "error",
-                parseUpstreamErrorBody(buffer) ||
-                  String(json.error?.message || "Upstream error")
-              );
-              return;
-            }
-            const content = normalizeContent(json?.choices?.[0]?.message?.content);
-            if (content) {
-              firstTokenMs = Math.max(0, Date.now() - startedAt);
-              finalize("ok", "");
-              return;
-            }
-            finalize("error", "Empty response");
-          } catch {
-            // Not JSON — likely a proxy error page.
-            const preview = String(buffer || "").trim().slice(0, 200);
-            finalize("error", preview || "Non-JSON upstream response");
-          }
-          return;
-        }
-
-        // Streaming path: report proxy error body if detected.
-        if (nonSseDetected) {
-          const preview = String(buffer || "").trim();
-          finalize(
-            "error",
-            parseUpstreamErrorBody(preview) || preview.slice(0, 200) || "Non-SSE upstream body"
-          );
-          return;
-        }
-
-        const failure = classifyBenchmarkFailure(stderr);
-        if (
-          attempt.label === "proxy" &&
-          index + 1 < attempts.length &&
-          firstByteMs === null &&
-          isProxyConnectionFailure(failure.message)
-        ) {
-          relayLog("proxy", "Proxy attempt failed during benchmark, retrying direct.", {
-            model,
-            message: failure.message
-          });
-          startAttempt(index + 1);
-          return;
-        }
-
-        finalize(failure.status, failure.message);
-      });
-
-      activeCurl.stdin.end(createBenchmarkBody(model, bufferedOnly));
-    }
-
-    startAttempt(0);
+  const url = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const body = JSON.stringify({
+    model,
+    messages: BENCHMARK_MESSAGES,
+    temperature: 0,
+    stream: true,
+    max_tokens: 8
   });
+
+  let firstByteMs = null;
+  let firstTokenMs = null;
+
+  function result(status, message) {
+    clearTimeout(timeoutId);
+    return {
+      model,
+      ok: status === "ok",
+      status,
+      firstByteMs,
+      firstTokenMs,
+      totalMs: firstTokenMs !== null ? firstTokenMs : Math.max(0, Date.now() - startedAt),
+      message: message || ""
+    };
+  }
+
+  try {
+    const { response } = await fetchUpstream(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+          Authorization: authorization,
+          ...extraHeaders
+        },
+        body,
+        signal: controller.signal
+      },
+      preferredProxy
+    );
+
+    firstByteMs = Math.max(0, Date.now() - startedAt);
+
+    if (!response.ok) {
+      const text = await response.text();
+      if (response.status === 401 || response.status === 403) {
+        return result("unauthorized", "The current key cannot access this model.");
+      }
+      if ([400, 404, 415, 422].includes(response.status)) {
+        return result("unsupported", parseUpstreamErrorBody(text) || "Unsupported");
+      }
+      return result("error", parseUpstreamErrorBody(text) || `HTTP ${response.status}`);
+    }
+
+    const reader = response.body?.getReader?.();
+    if (!reader) {
+      const text = await response.text();
+      if (text.trim()) {
+        firstTokenMs = Math.max(0, Date.now() - startedAt);
+        return result("ok", "");
+      }
+      return result("error", "Empty response");
+    }
+
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split(/\r?\n\r?\n/);
+      buffer = parts.pop() ?? "";
+      for (const part of parts) {
+        const payload = parseSseEventBlock(part);
+        const text = extractChunk(payload);
+        if (text) {
+          firstTokenMs = Math.max(0, Date.now() - startedAt);
+          try {
+            await reader.cancel();
+          } catch {}
+          return result("ok", "");
+        }
+      }
+    }
+
+    return result("error", "Stream closed without content");
+  } catch (error) {
+    if (controller.signal.aborted) {
+      return result("timeout", "Timed out before first content token.");
+    }
+    return result(
+      "error",
+      error instanceof Error ? error.message : String(error)
+    );
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 // ============================================================================
@@ -1080,11 +833,14 @@ async function handleListModels(req, res, providerId) {
 
   try {
     const models = await listProviderModels({
-      providerId,
       authorization,
       baseUrl,
       preferredProxy,
-      extraHeaders
+      extraHeaders,
+      debugFn: (level, message, details) =>
+        level === "error"
+          ? relayLogError("models", message, details)
+          : relayLog("models", message, details)
     });
     sendJson(res, 200, models);
   } catch (error) {
@@ -1133,13 +889,11 @@ async function handleChatCompletions(req, res, providerId) {
   const baseUrl = resolveUpstreamBaseUrl(req, providerId, body);
   const preferredProxy = resolveUpstreamProxy(req, body);
   const extraHeaders = buildProviderExtraHeaders(providerId, req, body);
-  const streamingMode = String(body?.streamingMode ?? "auto").toLowerCase();
+  const requestedStream = payloadBody?.stream !== false;
 
   const upstreamUrl = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
 
-  // Open the SSE response immediately so we can funnel relay_debug events to
-  // the front-end in real time. The actual upstream data is detected later
-  // and forwarded on top of the already-open stream.
+  // Open SSE response immediately so we can emit relay_debug events.
   setCorsHeaders(res, req);
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -1148,6 +902,8 @@ async function handleChatCompletions(req, res, providerId) {
     "X-Accel-Buffering": "no"
   });
   res.write(": stream-open\n\n");
+
+  let finished = false;
 
   function debug(scope, message, details) {
     const entry = relayLog(scope, message, details);
@@ -1159,32 +915,6 @@ async function handleChatCompletions(req, res, providerId) {
     emitSseDebug(res, entry);
   }
 
-  debug("chat", "Resolved upstream target.", {
-    provider: providerId,
-    upstreamUrl,
-    model: String(payloadBody?.model || ""),
-    stream: payloadBody?.stream !== false,
-    streamingMode,
-    preferredProxy: preferredProxy || "(direct)",
-    systemProxy: SYSTEM_PROXY || "",
-    authHeader: sanitizeAuthHeader(authorization),
-    extraHeaderCount: extraHeaders.length,
-    payloadPreview: sanitizePayloadForLog(payloadBody)
-  });
-
-  let streamStarted = true;
-  let upstreamDataReceived = false;
-  let finished = false;
-  let activeCurl = null;
-  let nonStreamingFallbackUsed = false;
-  const attempts = buildAttemptEnvs(preferredProxy);
-
-  // If the caller asked to skip streaming, go straight to the buffered path.
-  if (streamingMode === "buffered") {
-    void runNonStreamingFallback("streamingMode=buffered");
-    return;
-  }
-
   function fail(message) {
     if (finished) return;
     finished = true;
@@ -1193,62 +923,88 @@ async function handleChatCompletions(req, res, providerId) {
     res.end();
   }
 
-  function shouldTryNonStreamingFallback(detail) {
-    if (nonStreamingFallbackUsed) return false;
-    const normalized = String(detail || "").toLowerCase();
-    return (
-      normalized.includes("internal server error") ||
-      normalized.includes("bad gateway") ||
-      normalized.includes("proxy error") ||
-      /<html/i.test(detail || "") ||
-      /^\s*<\?xml/i.test(detail || "")
+  debug("chat", "Resolved upstream target.", {
+    provider: providerId,
+    upstreamUrl,
+    model: String(payloadBody?.model || ""),
+    requestedStream,
+    preferredProxy: preferredProxy || "(direct)",
+    systemProxy: SYSTEM_PROXY || "",
+    authHeader: sanitizeAuthHeader(authorization),
+    extraHeaderKeys: Object.keys(extraHeaders),
+    payloadPreview: sanitizePayloadForLog(payloadBody)
+  });
+
+  const controller = new AbortController();
+  req.on("aborted", () => controller.abort());
+
+  const upstreamInit = {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: requestedStream ? "text/event-stream" : "application/json",
+      Authorization: authorization,
+      ...extraHeaders
+    },
+    body: JSON.stringify(payloadBody),
+    signal: controller.signal
+  };
+
+  let upstream;
+  try {
+    upstream = await fetchUpstream(upstreamUrl, upstreamInit, preferredProxy, (level, msg, det) =>
+      level === "error" ? debugError("chat", msg, det) : debug("chat", msg, det)
     );
+  } catch (error) {
+    fail(error instanceof Error ? error.message : "Upstream connection failed.");
+    return;
   }
 
-  async function runNonStreamingFallback(previousErrorDetail) {
-    nonStreamingFallbackUsed = true;
-    debug("chat", "Falling back to non-streaming upstream request.", {
-      provider: providerId,
-      model: String(payloadBody?.model || ""),
-      previousErrorPreview: String(previousErrorDetail || "").slice(0, 300)
-    });
+  const { response, attempt } = upstream;
+  debug("chat", "Upstream response received.", {
+    status: response.status,
+    statusText: response.statusText,
+    contentType: response.headers.get("content-type") || "",
+    attemptLabel: attempt.label
+  });
 
-    const bufferedPayload = { ...payloadBody, stream: false };
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    fail(
+      parseUpstreamErrorBody(text) ||
+        `Upstream HTTP ${response.status} ${response.statusText}`
+    );
+    return;
+  }
 
+  const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+  const isStream =
+    contentType.includes("text/event-stream") ||
+    contentType.includes("stream");
+
+  // Non-streaming upstream (caller set stream:false, or server didn't
+  // honor the stream flag). Wrap the single JSON response into one SSE
+  // event + [DONE] so the front-end consumer works unchanged.
+  if (!isStream) {
     try {
-      const raw = await runCurlBuffered({
-        authorization,
-        url: upstreamUrl,
-        method: "POST",
-        headers: ["Content-Type: application/json", ...extraHeaders],
-        body: JSON.stringify(bufferedPayload),
-        preferredProxy
-      });
-
-      debug("chat", "Non-streaming upstream response received.", {
-        bytes: raw.length,
-        preview: raw.slice(0, 200)
-      });
-
+      const text = await response.text();
       let json;
       try {
-        json = JSON.parse(raw);
+        json = JSON.parse(text);
       } catch {
-        fail(
-          `Non-streaming fallback received a non-JSON response: ${String(raw).slice(0, 200)}`
-        );
+        fail(`Non-JSON upstream response: ${text.slice(0, 200)}`);
         return;
       }
 
       if (json?.error) {
-        fail(parseUpstreamErrorBody(raw) || "Upstream returned an error.");
+        fail(parseUpstreamErrorBody(text) || "Upstream returned an error.");
         return;
       }
 
       const message = json?.choices?.[0]?.message || {};
-      const content = normalizeContent(message.content);
+      const content = extractChunk({ choices: [{ message }] });
       const ssePayload = {
-        id: json?.id || `fallback-${Date.now()}`,
+        id: json?.id || `buffered-${Date.now()}`,
         object: "chat.completion.chunk",
         created: json?.created || Math.floor(Date.now() / 1000),
         model: json?.model || payloadBody?.model || "",
@@ -1260,205 +1016,45 @@ async function handleChatCompletions(req, res, providerId) {
           }
         ]
       };
-
       res.write(`data: ${JSON.stringify(ssePayload)}\n\n`);
       res.write("data: [DONE]\n\n");
       finished = true;
       res.end();
     } catch (error) {
-      fail(error instanceof Error ? error.message : "Non-streaming fallback failed.");
+      fail(error instanceof Error ? error.message : "Failed to read upstream response.");
     }
+    return;
   }
 
-  function startAttempt(index) {
-    const attempt = attempts[index];
-    let stderr = "";
-    let attemptCompleted = false;
-    let upstreamBuffer = "";
-    let detectedNonSse = false;
-    const attemptStartedAt = Date.now();
+  // Stream SSE chunks through unchanged.
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    fail("Upstream response has no readable body.");
+    return;
+  }
 
-    debug("chat", "Starting upstream curl attempt.", {
-      attemptIndex: index,
-      attemptLabel: attempt.label,
-      proxy: attempt.env.HTTPS_PROXY || "(direct)",
-      model: String(payloadBody?.model || "")
-    });
+  const decoder = new TextDecoder("utf-8");
+  let bytesForwarded = 0;
 
-    activeCurl = spawn(
-      CURL_BIN,
-      createCurlArgs({
-        authorization,
-        url: upstreamUrl,
-        method: "POST",
-        headers: ["Content-Type: application/json", ...extraHeaders],
-        dataFromStdin: true,
-        stream: true
-      }),
-      {
-        env: attempt.env,
-        stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: true
-      }
-    );
-
-    activeCurl.on("error", (error) => {
-      debugError("chat", "curl process spawn error.", {
-        error: error instanceof Error ? error.message : String(error)
-      });
-      fail(error instanceof Error ? error.message : "Failed to start curl");
-    });
-
-    activeCurl.stderr.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
-    });
-
-    activeCurl.stdout.on("data", (chunk) => {
-      if (finished) return;
-      const text = chunk.toString("utf8");
-
-      if (!upstreamDataReceived) {
-        upstreamBuffer += text;
-        const preview = upstreamBuffer.trimStart();
-        if (!preview) return;
-
-        const looksLikeSse =
-          preview.startsWith("data:") ||
-          preview.startsWith(":") ||
-          preview.startsWith("event:");
-
-        if (looksLikeSse) {
-          upstreamDataReceived = true;
-          debug("chat", "Upstream first bytes look like SSE, forwarding.", {
-            firstBytesPreview: upstreamBuffer.slice(0, 120),
-            attemptMs: Date.now() - attemptStartedAt
-          });
-          res.write(upstreamBuffer);
-          upstreamBuffer = "";
-          return;
-        }
-
-        detectedNonSse = true;
-        return;
-      }
-
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const text = decoder.decode(value, { stream: true });
+      bytesForwarded += text.length;
       res.write(text);
+    }
+
+    debug("chat", "Upstream stream completed.", { bytesForwarded });
+    finished = true;
+    res.end();
+  } catch (error) {
+    debugError("chat", "Upstream stream read error.", {
+      errorName: error?.name || "",
+      errorMessage: error?.message || String(error)
     });
-
-    activeCurl.stdout.on("end", () => {
-      if (finished || attemptCompleted) return;
-      attemptCompleted = true;
-
-      if (detectedNonSse) {
-        const rawBody = upstreamBuffer;
-        const upstreamMessage =
-          parseUpstreamErrorBody(rawBody) ||
-          formatCurlFailure(stderr || "Upstream returned an unexpected response.");
-
-        debugError("chat", "Upstream returned non-SSE body.", {
-          attemptLabel: attempt.label,
-          bytes: rawBody.length,
-          durationMs: Date.now() - attemptStartedAt,
-          rawPreview: rawBody.slice(0, 400),
-          stderrPreview: stderr.slice(0, 300),
-          upstreamMessage
-        });
-
-        if (
-          attempt.label === "proxy" &&
-          index + 1 < attempts.length &&
-          isProxyConnectionFailure(upstreamMessage)
-        ) {
-          debug("chat", "Proxy attempt failed, retrying direct.");
-          startAttempt(index + 1);
-          return;
-        }
-
-        if (shouldTryNonStreamingFallback(rawBody || upstreamMessage)) {
-          void runNonStreamingFallback(rawBody || upstreamMessage);
-          return;
-        }
-
-        fail(upstreamMessage);
-        return;
-      }
-
-      if (!upstreamDataReceived) {
-        const message = formatCurlFailure(stderr || "Upstream closed with no output.");
-        debugError("chat", "Upstream closed without data.", {
-          attemptLabel: attempt.label,
-          stderrPreview: stderr.slice(0, 300),
-          durationMs: Date.now() - attemptStartedAt,
-          message
-        });
-
-        if (
-          attempt.label === "proxy" &&
-          index + 1 < attempts.length &&
-          isProxyConnectionFailure(message)
-        ) {
-          startAttempt(index + 1);
-          return;
-        }
-
-        if (shouldTryNonStreamingFallback(message)) {
-          void runNonStreamingFallback(message);
-          return;
-        }
-
-        fail(message);
-        return;
-      }
-
-      debug("chat", "Upstream stream completed normally.", {
-        durationMs: Date.now() - attemptStartedAt
-      });
-      finished = true;
-      res.end();
-    });
-
-    activeCurl.on("close", (code) => {
-      if (finished || attemptCompleted) return;
-      attemptCompleted = true;
-      if (!upstreamDataReceived) {
-        const message = formatCurlFailure(
-          stderr || `curl exited with code ${code ?? "unknown"}`
-        );
-        debugError("chat", "curl exited without upstream data.", {
-          attemptLabel: attempt.label,
-          exitCode: code,
-          stderrPreview: stderr.slice(0, 300),
-          durationMs: Date.now() - attemptStartedAt,
-          message
-        });
-
-        if (
-          attempt.label === "proxy" &&
-          index + 1 < attempts.length &&
-          isProxyConnectionFailure(message)
-        ) {
-          startAttempt(index + 1);
-          return;
-        }
-        if (shouldTryNonStreamingFallback(message)) {
-          void runNonStreamingFallback(message);
-          return;
-        }
-        fail(message);
-        return;
-      }
-      finished = true;
-      res.end();
-    });
-
-    activeCurl.stdin.end(JSON.stringify(payloadBody));
+    fail(error instanceof Error ? error.message : "Stream read failed.");
   }
-
-  req.on("aborted", () => {
-    if (!finished) activeCurl?.kill();
-  });
-
-  startAttempt(0);
 }
 
 async function handleBenchmark(req, res, providerId) {
@@ -1479,8 +1075,6 @@ async function handleBenchmark(req, res, providerId) {
   const baseUrl = resolveUpstreamBaseUrl(req, providerId, body);
   const preferredProxy = resolveUpstreamProxy(req, body);
   const extraHeaders = buildProviderExtraHeaders(providerId, req, body);
-  const streamingMode = String(body?.streamingMode ?? "auto").toLowerCase();
-  const bufferedOnly = streamingMode === "buffered";
 
   const models = Array.from(
     new Set(
@@ -1524,34 +1118,25 @@ async function handleBenchmark(req, res, providerId) {
 
   await new Promise((resolvePromise) => {
     function flushDone() {
-      if (responseClosed) {
-        resolvePromise();
-        return;
-      }
+      if (responseClosed) return resolvePromise();
       sendSse(res, { type: "done", total: models.length, completed, results });
       res.end();
       resolvePromise();
     }
 
     function launchNext() {
-      if (responseClosed) {
-        resolvePromise();
-        return;
-      }
-
+      if (responseClosed) return resolvePromise();
       while (active < concurrency && cursor < models.length) {
         const model = models[cursor];
         cursor += 1;
         active += 1;
-
         benchmarkModel({
           authorization,
           baseUrl,
           model,
           timeoutMs,
           preferredProxy,
-          extraHeaders,
-          bufferedOnly
+          extraHeaders
         })
           .then((result) => {
             results.push(result);
@@ -1687,7 +1272,7 @@ async function handleSessionDelete(req, res) {
 }
 
 // ============================================================================
-// Test command (used by smoke tests)
+// Test command (used by E2E tests)
 // ============================================================================
 
 let pendingTestCommand = null;
@@ -1814,94 +1399,8 @@ function handleTestCommandStatus(res, requestUrl) {
 }
 
 // ============================================================================
-// Diagnose handler
+// Server
 // ============================================================================
-
-async function handleDiagnose(req, res) {
-  let body = {};
-  try {
-    const contentType = String(req.headers["content-type"] || "").toLowerCase();
-    body = contentType.includes("application/x-www-form-urlencoded")
-      ? await readFormBody(req)
-      : await readJsonBody(req);
-  } catch {
-    sendJson(res, 400, { error: { message: "Invalid body" } });
-    return;
-  }
-
-  const providerId =
-    body.provider === "openrouter" ? "openrouter" : "nvidia";
-  const authorization = resolveRelayAuthorization(req, body);
-  const baseUrl = resolveUpstreamBaseUrl(req, providerId, body);
-  const preferredProxy = resolveUpstreamProxy(req, body);
-  const extraHeaders = buildProviderExtraHeaders(providerId, req, body);
-
-  const result = {
-    platform: process.platform,
-    systemProxy: SYSTEM_PROXY || "",
-    providerId,
-    baseUrl,
-    usingProxy: preferredProxy || "",
-    curlVersion: "",
-    steps: []
-  };
-
-  try {
-    const version = execFileSync(CURL_BIN, ["--version"], {
-      encoding: "utf8",
-      windowsHide: true
-    });
-    result.curlVersion = version.split("\n")[0];
-  } catch (error) {
-    result.curlVersion = `unavailable: ${error instanceof Error ? error.message : String(error)}`;
-  }
-
-  async function probe(label, fn) {
-    const startedAt = Date.now();
-    try {
-      const detail = await fn();
-      result.steps.push({
-        label,
-        ok: true,
-        durationMs: Date.now() - startedAt,
-        detail
-      });
-    } catch (error) {
-      result.steps.push({
-        label,
-        ok: false,
-        durationMs: Date.now() - startedAt,
-        error: error instanceof Error ? error.message : String(error)
-      });
-    }
-  }
-
-  // Probe 1: reachability of the base URL with no auth (to rule out network).
-  await probe(`GET ${baseUrl}/models (auth + proxy)`, async () => {
-    if (!authorization) {
-      throw new Error("Missing API key — diagnose skipped.");
-    }
-    const raw = await runCurlBuffered({
-      authorization,
-      url: `${baseUrl.replace(/\/+$/, "")}/models`,
-      method: "GET",
-      headers: ["Accept: application/json", ...extraHeaders],
-      preferredProxy
-    });
-    try {
-      const json = JSON.parse(raw);
-      return {
-        modelCount: Array.isArray(json?.data) ? json.data.length : 0
-      };
-    } catch {
-      return { bodyPreview: String(raw).slice(0, 200) };
-    }
-  });
-
-  sendJson(res, 200, result);
-}
-
-
 
 const server = createServer(async (req, res) => {
   if (!req.url) {
@@ -1923,7 +1422,7 @@ const server = createServer(async (req, res) => {
     sendJson(res, 200, {
       ok: true,
       platform: process.platform,
-      transport: "curl",
+      transport: "fetch+undici",
       systemProxy: SYSTEM_PROXY || "",
       sessionRoot: SESSION_ROOT,
       providers: Object.keys(PROVIDER_META)
@@ -1941,19 +1440,12 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "POST" && pathname === "/diagnose") {
-    await handleDiagnose(req, res);
-    return;
-  }
-
-  // Provider-agnostic routes: /<provider>/v1/{models,chat/completions,benchmark}
   const providerRouteMatch = pathname.match(
     /^\/(nvidia|openrouter)\/v1\/(models|chat\/completions|benchmark)$/
   );
   if (providerRouteMatch) {
     const providerId = providerRouteMatch[1];
     const endpoint = providerRouteMatch[2];
-
     if (endpoint === "models" && (req.method === "GET" || req.method === "POST")) {
       await handleListModels(req, res, providerId);
       return;
@@ -1968,7 +1460,6 @@ const server = createServer(async (req, res) => {
     }
   }
 
-  // Legacy NVIDIA routes for backwards compatibility
   if (req.method === "POST" && pathname === "/nvidia/v1/models/benchmark") {
     await handleBenchmark(req, res, "nvidia");
     return;
@@ -2010,6 +1501,7 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`WPS AI relay listening on http://127.0.0.1:${PORT}`);
   console.log(`  platform: ${process.platform}`);
+  console.log(`  transport: Node fetch + undici ProxyAgent`);
   console.log(`  session root: ${SESSION_ROOT}`);
   if (SYSTEM_PROXY) {
     console.log(`  default proxy: ${SYSTEM_PROXY}`);

@@ -910,12 +910,12 @@ export async function* streamCompletion({ settings, messages, signal }) {
 
   const url = `${providerMeta.relayPrefix}/chat/completions`;
 
-  // Prefer the compatibility form-encoded transport. It has proven most
-  // reliable inside the WPS embedded browser on both Windows and macOS.
-  const requestHeaders = {
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
-  };
-  const requestBody = createRelayChatFormBody(settings, messages);
+  // Relay now accepts plain JSON + standard headers from the front-end. It
+  // internally uses Node fetch + undici ProxyAgent to talk to the upstream,
+  // which removes the old curl + form-encoded indirection entirely.
+  const provider2 = getActiveProviderRecord(settings);
+  const requestHeaders = createRelayRequestHeaders(settings, provider2);
+  const requestBody = JSON.stringify(buildChatPayload(settings, messages));
 
   let receivedFirstChunk = false;
   let receivedEvent = false;
