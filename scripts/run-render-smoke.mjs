@@ -66,11 +66,19 @@ async function waitForServer(url, timeoutMs) {
 }
 
 async function resolveEdgePath() {
-  const candidates = [
-    process.env["ProgramFiles(x86)"] && `${process.env["ProgramFiles(x86)"]}\\Microsoft\\Edge\\Application\\msedge.exe`,
-    process.env.ProgramFiles && `${process.env.ProgramFiles}\\Microsoft\\Edge\\Application\\msedge.exe`,
-    process.env.LOCALAPPDATA && `${process.env.LOCALAPPDATA}\\Microsoft\\Edge\\Application\\msedge.exe`
-  ].filter(Boolean);
+  const candidates =
+    process.platform === "win32"
+      ? [
+          process.env["ProgramFiles(x86)"] && `${process.env["ProgramFiles(x86)"]}\\Microsoft\\Edge\\Application\\msedge.exe`,
+          process.env.ProgramFiles && `${process.env.ProgramFiles}\\Microsoft\\Edge\\Application\\msedge.exe`,
+          process.env.LOCALAPPDATA && `${process.env.LOCALAPPDATA}\\Microsoft\\Edge\\Application\\msedge.exe`
+        ].filter(Boolean)
+      : process.platform === "darwin"
+        ? [
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          ]
+        : ["/usr/bin/microsoft-edge", "/usr/bin/google-chrome", "/usr/bin/chromium"];
 
   for (const candidate of candidates) {
     try {
@@ -81,7 +89,7 @@ async function resolveEdgePath() {
     }
   }
 
-  throw new Error("Unable to find Microsoft Edge.");
+  throw new Error("Unable to find Microsoft Edge or Chrome.");
 }
 
 function extractSmokeJson(html) {
@@ -111,10 +119,11 @@ async function stopProcessTree(child) {
 }
 
 async function main() {
-  await runCommand("npm.cmd", ["exec", "vite", "build"], { shell: true });
+  const npmBin = process.platform === "win32" ? "npm.cmd" : "npm";
+  await runCommand(npmBin, ["exec", "vite", "build"], { shell: true });
 
   const preview = spawn(
-    "npm.cmd",
+    npmBin,
     ["run", "preview", "--", "--host", HOST, "--port", String(PORT), "--strictPort"],
     {
       cwd: process.cwd(),

@@ -6,10 +6,14 @@
 	"description": "WPS AI plugin with OpenRouter/NVIDIA support and streaming document output",
 	"scripts": {
 		"dev": "vite --port 3889",
-		"build": "vite build && powershell -ExecutionPolicy Bypass -File .\\server\\install-local-addon.ps1",
+		"build": "vite build",
+		"install:win": "powershell -ExecutionPolicy Bypass -File ./server/install-local-addon.ps1",
+		"install:mac": "bash ./server/install-local-addon.sh",
+		"build:win": "npm run build && npm run install:win",
+		"build:mac": "npm run build && npm run install:mac",
 		"preview": "vite preview",
-		"test:render-smoke": "node .\\scripts\\run-render-smoke.mjs",
-		"debug": "powershell -ExecutionPolicy Bypass -File .\\server\\start-relay.ps1 && wpsjs debug",
+		"test:render-smoke": "node ./scripts/run-render-smoke.mjs",
+		"debug": "wpsjs debug",
 		"relay": "node server/relay.mjs"
 	},
 	"dependencies": {
